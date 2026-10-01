@@ -1,0 +1,5 @@
+1 (1 << 0 / Bit 0) = Wall (Impassable)
+2 (1 << 1 / Bit 1) = Pellet (Dot)
+4 (1 << 2 / Bit 2) = Power Pellet (Energizer)
+8 (1 << 3 / Bit 3) = Ghost Gate (Only ghosts pass)
+16 (1 << 4 / Bit 4) = Player Spawn / Location

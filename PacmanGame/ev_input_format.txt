@@ -1,0 +1,11 @@
+player_pos = vector2
+powerup_timer = (int)
+inky_pos = vector2
+blinky_pos = vector2
+pinky_pos = vector2
+clyde_pos = vector2
+up = boolean
+down = boolean
+left = boolean
+right = boolean
+[latent space vectors]
