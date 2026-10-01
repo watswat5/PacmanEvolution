@@ -1,1 +1,4 @@
 deap==1.4.4
+numpy>=1.26
+pillow>=10
+matplotlib>=3.8

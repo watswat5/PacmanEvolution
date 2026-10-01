@@ -8,8 +8,12 @@ import csv
 import re
 from dataclasses import replace
 from pathlib import Path
+from typing import TYPE_CHECKING
 
-from PIL import Image, ImageDraw
+# Pillow is only needed to draw boards. Importing it lazily keeps the game,
+# board files, and GP training usable without it.
+if TYPE_CHECKING:
+    from PIL import Image
 
 try:
     from .board import Board, BoardState, GameBoard
@@ -291,6 +295,8 @@ def write_board(board: GameBoard, path: Path) -> None:
 
 
 def load_sprite(name: str, tile_size: tuple[int, int]) -> Image.Image:
+    from PIL import Image
+
     path = GRAPHICS_DIR / name
     sprite = Image.open(path).convert("RGBA")
     if sprite.size != tile_size:
@@ -302,6 +308,8 @@ def load_sprite(name: str, tile_size: tuple[int, int]) -> Image.Image:
 
 
 def render_board(board: GameBoard) -> Image.Image:
+    from PIL import Image, ImageDraw
+
     """Compose a board image, always placing floor below every other layer."""
     floor = Image.open(GRAPHICS_DIR / "floor.png").convert("RGBA")
     tile_width, tile_height = floor.size

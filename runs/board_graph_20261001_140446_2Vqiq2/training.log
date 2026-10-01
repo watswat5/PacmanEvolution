@@ -1,0 +1,30 @@
+Traceback (most recent call last):
+  File "/home/chris/Documents/School/Fall 2026/CSCI4560/PacmanEvolution/PacmanGame/board_graph.py", line 12, in <module>
+    from .render_board import GHOST_GATE, PELLET, POWER_PELLET, WALL
+  File "/home/chris/Documents/School/Fall 2026/CSCI4560/PacmanEvolution/PacmanGame/render_board.py", line 12, in <module>
+    from PIL import Image, ImageDraw
+ModuleNotFoundError: No module named 'PIL'
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "/home/chris/Documents/School/Fall 2026/CSCI4560/PacmanEvolution/GeneticAlgo/train_pacman.py", line 60, in <module>
+    from PacmanGame import Board, PacmanGame, precompute_board_graph, read_board
+  File "/home/chris/Documents/School/Fall 2026/CSCI4560/PacmanEvolution/PacmanGame/__init__.py", line 4, in <module>
+    from .board_graph import MOVE_FEATURE_NAMES, ObservationProvider, StaticBoardGraph, precompute_board_graph
+  File "/home/chris/Documents/School/Fall 2026/CSCI4560/PacmanEvolution/PacmanGame/board_graph.py", line 14, in <module>
+    from board import GameBoard, Point
+ModuleNotFoundError: No module named 'board'
+
+The above exception was the direct cause of the following exception:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 189, in _run_module_as_main
+  File "<frozen runpy>", line 112, in _get_module_details
+  File "/home/chris/Documents/School/Fall 2026/CSCI4560/PacmanEvolution/GeneticAlgo/__init__.py", line 8, in <module>
+    from .train_pacman import (
+    ...<14 lines>...
+    )
+  File "/home/chris/Documents/School/Fall 2026/CSCI4560/PacmanEvolution/GeneticAlgo/train_pacman.py", line 62, in <module>
+    raise ImportError("run GP training from the project root so PacmanGame is importable") from exc
+ImportError: run GP training from the project root so PacmanGame is importable

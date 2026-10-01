@@ -18,6 +18,35 @@ ACTIONS = ("up", "down", "left", "right")
 DIRECTIONS = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0)}
 REVERSE_DIRECTION = {"up": "down", "down": "up", "left": "right", "right": "left"}
 GHOST_KEYS = ("blinky_pos", "pinky_pos", "inky_pos", "clyde_pos")
+DEFAULT_POWERUP_DURATION = 40
+# Tile-path radius used by ``danger_ghosts_nearby``.
+GHOST_NEAR_RADIUS = 8
+# Pac-Man steps that ``recently_visited`` remembers (also the trainer's
+# revisit-penalty window).
+VISIT_WINDOW = 12
+
+# Every value is bounded: distances are normalized to [0, 1) with exactly 1.0
+# meaning "no such target / unreachable", flags and fractions lie in [0, 1],
+# and ``pellet_center_direction`` lies in [-1, 1].
+MOVE_FEATURE_NAMES = (
+    "pellet_here",
+    "pellet_distance",
+    "power_pellet_distance",
+    "danger_ghost_distance",
+    "second_danger_ghost_distance",
+    "danger_ghosts_nearby",
+    "edible_ghost_distance",
+    "frightened_time",
+    "is_reverse",
+    "is_forward",
+    "candidate_degree",
+    "pellets_ahead",
+    "steps_to_junction",
+    "escape_options",
+    "dead_end_depth",
+    "recently_visited",
+    "pellet_center_direction",
+)
 LayoutKey = tuple[tuple[bool, ...], ...]
 
 
@@ -57,6 +86,13 @@ class StaticBoardGraph:
         # Reachable distances occupy [0, 1); exactly 1 means unreachable.
         self.distance_scale = float(longest_reachable + 1)
         self.corridors = MappingProxyType(self._build_corridors())
+        # Continuations available where each move's corridor ends, excluding
+        # the corridor just travelled (0 at a dead end, up to 3).
+        self.corridor_exits = MappingProxyType({
+            key: max(0, self.degrees[path[-1]] - 1)
+            for key, path in self.corridors.items()
+        })
+        self.pocket_depths = MappingProxyType(self._build_pocket_depths())
 
     def _destination(self, point: Point, direction: str) -> Point | None:
         dx, dy = DIRECTIONS[direction]
@@ -110,6 +146,43 @@ class StaticBoardGraph:
                 result[(origin, action)] = tuple(path)
         return result
 
+    def _build_pocket_depths(self) -> dict[tuple[Point, str], int]:
+        """Depth of the dead-end pocket each move enters, or 0 if none.
+
+        A move from ``origin`` to ``candidate`` enters a pocket when the edge
+        between them is a bridge (without it, ``candidate`` cannot reach
+        ``origin``, so the only way out is back the way Pac-Man came) *and* the
+        candidate's side is the smaller side. The size check stops a move that
+        leaves a dead end from being labelled as entering the rest of the maze.
+        The depth is the farthest pocket tile counted from ``origin`` (a one-tile
+        dead end has depth 1).
+        """
+        result = {}
+        for origin, adjacent in self.neighbors.items():
+            origin_id = self.point_ids[origin]
+            component_size = sum(
+                d < self.unreachable_distance for d in self.distances[origin_id]
+            )
+            for action, candidate in adjacent.items():
+                start = self.point_ids[candidate]
+                seen = {start: 0}
+                queue = deque([start])
+                escaped = False
+                while queue and not escaped:
+                    tile = queue.popleft()
+                    for other in self._neighbor_ids[tile]:
+                        if tile == start and other == origin_id:
+                            continue  # the removed edge
+                        if other == origin_id:
+                            escaped = True
+                            break
+                        if other not in seen:
+                            seen[other] = seen[tile] + 1
+                            queue.append(other)
+                is_pocket = not escaped and 2 * len(seen) < component_size
+                result[(origin, action)] = max(seen.values()) + 1 if is_pocket else 0
+        return result
+
     def distance(self, first: Point, second: Point) -> int:
         first_id = self.point_ids.get(first)
         second_id = self.point_ids.get(second)
@@ -136,7 +209,13 @@ def precompute_board_graph(board: GameBoard) -> StaticBoardGraph:
 class ObservationProvider:
     """Per-game dynamic state backed by a shared precomputed graph."""
 
-    def __init__(self, board: GameBoard, static_graph: StaticBoardGraph | None = None):
+    def __init__(
+        self,
+        board: GameBoard,
+        static_graph: StaticBoardGraph | None = None,
+        *,
+        powerup_duration: int = DEFAULT_POWERUP_DURATION,
+    ):
         self.static = static_graph or precompute_board_graph(board)
         if (self.static.width, self.static.height) != (board.width, board.height):
             raise ValueError("static board graph dimensions do not match board")
@@ -146,6 +225,9 @@ class ObservationProvider:
         self.degrees = self.static.degrees
         self.unreachable_distance = self.static.unreachable_distance
         self.distance_scale = self.static.distance_scale
+        self.powerup_duration = max(1, powerup_duration)
+        self._visit_clock = 0
+        self._last_visit: dict[Point, int] = {}
         self._pellets: set[Point] = set()
         self._power_pellets: set[Point] = set()
         self._collectibles: set[Point] = set()
@@ -167,6 +249,25 @@ class ObservationProvider:
         self._collectible_sum_y = sum(y for _, y in self._collectibles)
         self._distance_cache.clear()
         self._ghost_signature = None
+        self._visit_clock = 0
+        self._last_visit = {board.player_pos: 0}
+
+    def player_moved(self, point: Point) -> None:
+        """Record Pac-Man's tile after one game step (including standing still)."""
+        self._visit_clock += 1
+        self._last_visit[point] = self._visit_clock
+
+    def visit_age(self, point: Point) -> int | None:
+        """Steps since Pac-Man last stood on ``point``, or None if never."""
+        last = self._last_visit.get(point)
+        return None if last is None else self._visit_clock - last
+
+    def _recently_visited(self, point: Point) -> float:
+        """1.0 for the tile just left, fading linearly to 0 after VISIT_WINDOW."""
+        age = self.visit_age(point)
+        if age is None or age > VISIT_WINDOW:
+            return 0.0
+        return (VISIT_WINDOW - max(age, 1) + 1) / VISIT_WINDOW
 
     def pellet_consumed(self, point: Point, *, ordinary: bool, power: bool) -> None:
         was_collectible = point in self._collectibles
@@ -242,11 +343,8 @@ class ObservationProvider:
             self._distance_cache[target] = MappingProxyType(distances)
         return self._distance_cache[target]
 
-    def _nearest_ghost(self, candidate: Point, ghosts: tuple[Point, ...]) -> int:
-        return min(
-            (self.static.distance(candidate, ghost) for ghost in ghosts),
-            default=self.unreachable_distance,
-        )
+    def _ghost_distances(self, candidate: Point, ghosts: tuple[Point, ...]) -> list[int]:
+        return sorted(self.static.distance(candidate, ghost) for ghost in ghosts)
 
     def _normalized_distance(self, distance: int) -> float:
         if distance >= self.unreachable_distance:
@@ -257,16 +355,22 @@ class ObservationProvider:
         self, board: GameBoard, last_direction: str
     ) -> dict[str, dict[str, float]]:
         ghosts = self._sync_ghosts(board)
+        frightened = board.player_powerup
         pellet_distances = self.distance_map("pellet", board)
         power_distances = self.distance_map("power_pellet", board)
+        frightened_time = min(1.0, board.player_powerup_turns / self.powerup_duration)
+        unreachable = self.unreachable_distance
         adjacent = self.neighbors.get(board.player_pos, {})
         result = {}
         for action in ACTIONS:
             candidate = adjacent.get(action)
             if candidate is None:
                 continue
-            corridor = self.static.corridors[(board.player_pos, action)]
-            ghost_distance = self._nearest_ghost(candidate, ghosts)
+            key = (board.player_pos, action)
+            corridor = self.static.corridors[key]
+            ghost_distances = self._ghost_distances(candidate, ghosts)
+            danger = [] if frightened else ghost_distances
+            edible = ghost_distances if frightened else []
             result[action] = {
                 "pellet_here": float(candidate in self._pellets),
                 "pellet_distance": self._normalized_distance(
@@ -276,18 +380,34 @@ class ObservationProvider:
                     power_distances[candidate]
                 ),
                 "danger_ghost_distance": self._normalized_distance(
-                    self.unreachable_distance if board.player_powerup else ghost_distance
+                    danger[0] if danger else unreachable
+                ),
+                "second_danger_ghost_distance": self._normalized_distance(
+                    danger[1] if len(danger) > 1 else unreachable
+                ),
+                "danger_ghosts_nearby": (
+                    sum(d <= GHOST_NEAR_RADIUS for d in danger) / len(GHOST_KEYS)
                 ),
                 "edible_ghost_distance": self._normalized_distance(
-                    ghost_distance if board.player_powerup else self.unreachable_distance
+                    edible[0] if edible else unreachable
                 ),
+                "frightened_time": frightened_time,
                 "is_reverse": float(action == REVERSE_DIRECTION.get(last_direction)),
                 "is_forward": float(action == last_direction),
                 "candidate_degree": self.degrees[candidate] / 4.0,
                 "pellets_ahead": (
                     sum(p in self._pellets for p in corridor) / len(corridor)
                 ),
-                "steps_to_junction": (len(corridor) - 1) / self.distance_scale,
+                # A corridor that loops back round can outrun the
+                # shortest-path scale, so clamp to keep the feature in [0, 1].
+                "steps_to_junction": min(
+                    1.0, (len(corridor) - 1) / self.distance_scale
+                ),
+                "escape_options": self.static.corridor_exits[key] / 3.0,
+                "dead_end_depth": self._normalized_distance(
+                    self.static.pocket_depths[key]
+                ),
+                "recently_visited": self._recently_visited(candidate),
                 "pellet_center_direction": self._pellet_center_alignment(
                     board.player_pos, action
                 ),

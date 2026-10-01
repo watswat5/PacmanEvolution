@@ -2,8 +2,7 @@
 import argparse, pickle, random
 from pathlib import Path
 from PacmanGame import PacmanGame, read_board
-from .gp_core import build_primitive_set
-from .train_board_graph import FEATURE_NAMES, choose_move
+from .train_board_graph import build_primitive_set, choose_move
 from .watch_individual import open_video_writer, rendered_frame, write_frame
 
 def main():
@@ -24,7 +23,7 @@ def main():
     args = parser.parse_args()
     with args.individual.open("rb") as handle:
         individual = pickle.load(handle)
-    pset = build_primitive_set(FEATURE_NAMES, constants=(-1, 0, 1))
+    pset = build_primitive_set()
     game, rng = PacmanGame(read_board(args.board)), random.Random(args.seed)
     frame = rendered_frame(game, args.scale)
     writer = open_video_writer(args.video, frame.width, frame.height, args.fps)

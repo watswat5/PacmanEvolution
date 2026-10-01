@@ -75,6 +75,58 @@ def build_primitive_set(
     return pset
 
 
+MOVE_DIVIDE_LIMIT = 1_000.0
+MOVE_DIVIDE_EPSILON = 1e-3
+
+
+def bounded_divide(a: float, b: float) -> float:
+    """Division that stays monotonic near zero and never leaves +/-1000.
+
+    The older ``protected_divide`` returns ``a`` when ``b`` is 0, so with
+    normalized distances ``1 / pellet_distance`` would rank an adjacent pellet
+    (distance 0) *below* one several tiles away. Flooring the denominator's
+    magnitude keeps "closer means larger" intact.
+    """
+    if abs(b) < MOVE_DIVIDE_EPSILON:
+        b = MOVE_DIVIDE_EPSILON if b >= 0 else -MOVE_DIVIDE_EPSILON
+    return max(-MOVE_DIVIDE_LIMIT, min(MOVE_DIVIDE_LIMIT, a / b))
+
+
+def if_lte(a: float, b: float, then: float, otherwise: float) -> float:
+    """Return ``then`` when ``a <= b``, else ``otherwise`` (lets trees switch modes)."""
+    return then if a <= b else otherwise
+
+
+def build_move_primitive_set(
+    terminal_names: Sequence[str],
+    constants: Iterable[float] = (-1, 0, 0.5, 1, 2),
+) -> gp.PrimitiveSet:
+    """Primitive set for the shared move-scoring tree.
+
+    Every terminal is a bounded per-move feature, so this set leaves out
+    primitives that only made sense for raw coordinates (``dist``) or that turn
+    bounded inputs into noise (``sin``/``cos``/``tan``/``log``). ``if_lte``
+    adds explicit branching, for example "flee unless frightened".
+    """
+    pset = gp.PrimitiveSet("PACMAN_MOVE", len(terminal_names))
+    pset.renameArguments(
+        **{f"ARG{index}": name for index, name in enumerate(terminal_names)}
+    )
+    pset.addPrimitive(operator.add, 2, name="add")
+    pset.addPrimitive(operator.sub, 2, name="sub")
+    pset.addPrimitive(operator.mul, 2, name="mul")
+    pset.addPrimitive(bounded_divide, 2, name="div")
+    pset.addPrimitive(min, 2, name="min")
+    pset.addPrimitive(max, 2, name="max")
+    pset.addPrimitive(abs, 1, name="abs")
+    pset.addPrimitive(operator.neg, 1, name="neg")
+    pset.addPrimitive(protected_sqrt, 1, name="sqrt")
+    pset.addPrimitive(if_lte, 4, name="if_lte")
+    for index, value in enumerate(constants):
+        pset.addTerminal(float(value), name=f"constant_{index}")
+    return pset
+
+
 def build_toolbox(
     primitive_set: gp.PrimitiveSet,
     min_depth: int,

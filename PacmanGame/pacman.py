@@ -89,7 +89,9 @@ class PacmanGame:
         }
         self._gate_positions = self._find_gate_positions()
         self._ghost_house = self._find_ghost_house()
-        self._observation_provider = ObservationProvider(self.board, board_graph)
+        self._observation_provider = ObservationProvider(
+            self.board, board_graph, powerup_duration=POWERUP_DURATION
+        )
         self._sync_board_observations()
 
     @staticmethod
@@ -443,6 +445,7 @@ class PacmanGame:
                 player_powerup_turns=remaining,
             )
         self._move_player(direction)
+        self._observation_provider.player_moved(self.board.player_pos)
         next_turn = self.turn + 1
         ghosts_move_this_turn = (
             not self.board.player_powerup or next_turn % 2 == 0

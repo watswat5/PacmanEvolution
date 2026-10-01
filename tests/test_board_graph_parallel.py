@@ -29,7 +29,7 @@ class BoardGraphParallelTests(unittest.TestCase):
 
     def test_parallel_matches_serial_with_random_ties_and_multiple_boards(self) -> None:
         random.seed(42)
-        primitive_set = build_primitive_set(FEATURE_NAMES, constants=(-1, 0, 1))
+        primitive_set = build_primitive_set(FEATURE_NAMES)
         toolbox = build_toolbox(primitive_set, 2, 3, 4, 0.5, 0.8)
         population = toolbox.population(n=12)
         board = read_board(VALIDATION_BOARD_PATH)

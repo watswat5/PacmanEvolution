@@ -3,7 +3,7 @@
 from pathlib import Path
 import unittest
 
-from PacmanGame import PacmanGame, precompute_board_graph, read_board
+from PacmanGame import MOVE_FEATURE_NAMES, PacmanGame, precompute_board_graph, read_board
 from PacmanGame.render_board import WALL
 
 
@@ -23,12 +23,7 @@ class BoardGraphTests(unittest.TestCase):
             {move for move, legal in self.game.legal_moves().items() if legal},
         )
         self.assertEqual(before, self.game.observation())
-        expected_features = {
-            "pellet_here", "pellet_distance", "power_pellet_distance",
-            "danger_ghost_distance", "edible_ghost_distance", "is_reverse",
-            "is_forward", "candidate_degree", "pellets_ahead",
-            "steps_to_junction", "pellet_center_direction",
-        }
+        expected_features = set(MOVE_FEATURE_NAMES)
         for features in observations.values():
             self.assertEqual(set(features), expected_features)
             self.assertTrue(all(
@@ -40,12 +35,8 @@ class BoardGraphTests(unittest.TestCase):
             self.assertLessEqual(features["pellet_center_direction"], 1.0)
             self.assertLessEqual(features["candidate_degree"], 1.0)
             self.assertLessEqual(features["pellets_ahead"], 1.0)
-            for name in (
-                "pellet_distance", "power_pellet_distance",
-                "danger_ghost_distance", "edible_ghost_distance",
-                "steps_to_junction",
-            ):
-                self.assertLessEqual(features[name], 1.0)
+            for name in MOVE_FEATURE_NAMES:
+                self.assertLessEqual(features[name], 1.0, name)
 
     def test_static_graph_and_distance_maps_cannot_be_mutated(self) -> None:
         point = self.game.board.player_pos

@@ -24,13 +24,14 @@ import numpy as np
 from deap import algorithms, base, creator, gp, tools
 
 try:
-    from .gp_core import build_primitive_set, safe_number, select_over
+    from .gp_core import build_move_primitive_set, safe_number, select_over
 except ImportError:
-    from gp_core import build_primitive_set, safe_number, select_over
+    from gp_core import build_move_primitive_set, safe_number, select_over
 
 try:
     from PacmanGame import (
         ACTIONS,
+        MOVE_FEATURE_NAMES,
         Board,
         PacmanGame,
         precompute_board_graph,
@@ -45,21 +46,10 @@ except ImportError as exc:
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 VALIDATION_BOARD_PATH = PROJECT_DIR / "PacmanGame" / "test_board.txt"
 GENERATION_SEED_STRIDE = 1_000_003
-FEATURE_NAMES = (
-    "pellet_here",
-    "pellet_distance",
-    "power_pellet_distance",
-    "danger_ghost_distance",
-    "edible_ghost_distance",
-    "is_reverse",
-    "is_forward",
-    "candidate_degree",
-    "pellets_ahead",
-    "steps_to_junction",
-    "pellet_center_direction",
-)
+FEATURE_NAMES = MOVE_FEATURE_NAMES
 DEATH_PENALTY = 10_000.0
 NON_SCORING_MOVE_PENALTY = 100.0
+REVISIT_PENALTY = 50.0
 NORMALIZED_CLEAR_SCORE = 100_000.0
 
 
@@ -154,6 +144,11 @@ def build_toolbox(
     return toolbox
 
 
+def build_primitive_set(feature_names=FEATURE_NAMES) -> gp.PrimitiveSet:
+    """The one primitive set used by training, watching, and tests."""
+    return build_move_primitive_set(feature_names)
+
+
 @lru_cache(maxsize=8192)
 def _compile_tree(expression: str, primitive_set: gp.PrimitiveSet) -> Callable:
     return gp.compile(expr=expression, pset=primitive_set)
@@ -223,6 +218,7 @@ def evaluate_population_lockstep(
     stagnation_penalty: float = NON_SCORING_MOVE_PENALTY,
     stagnation_grace_steps: int = 0,
     stagnation_termination_steps: int = 50,
+    revisit_penalty: float = REVISIT_PENALTY,
     seed: int = 0,
     index_offset: int = 0,
     random_tie_break: bool = False,
@@ -245,9 +241,10 @@ def evaluate_population_lockstep(
     for _ in range(timestep_limit):
         for index in active:
             game = games[index]
+            observations = game.get_move_observations()
             move, _ = choose_move(
                 population[index],
-                game.get_move_observations(),
+                observations,
                 primitive_set,
                 game.player_direction,
                 rngs[index],
@@ -262,6 +259,10 @@ def evaluate_population_lockstep(
                 scoreless_steps[index] += 1
                 if scoreless_steps[index] > stagnation_grace_steps:
                     stagnation_costs[index] += stagnation_penalty
+                # Extra cost for dithering: stepping back onto a tile visited
+                # within VISIT_WINDOW steps without scoring anything.
+                if move and observations[move]["recently_visited"] > 0:
+                    stagnation_costs[index] += revisit_penalty
                 if scoreless_steps[index] >= stagnation_termination_steps:
                     stagnated[index] = True
         active = [
@@ -318,7 +319,7 @@ def _evaluate_population_chunk(task: tuple) -> tuple[int, list[float], list[floa
     (
         start, individuals, board, timestep_limit, primitive_set, parsimony,
         stagnation_penalty, stagnation_grace_steps,
-        stagnation_termination_steps, seed, random_tie_break,
+        stagnation_termination_steps, revisit_penalty, seed, random_tie_break,
     ) = task
     fitnesses, _, pellet_ratios, labels = evaluate_population_lockstep(
         individuals,
@@ -329,6 +330,7 @@ def _evaluate_population_chunk(task: tuple) -> tuple[int, list[float], list[floa
         stagnation_penalty=stagnation_penalty,
         stagnation_grace_steps=stagnation_grace_steps,
         stagnation_termination_steps=stagnation_termination_steps,
+        revisit_penalty=revisit_penalty,
         seed=seed,
         index_offset=start,
         random_tie_break=random_tie_break,
@@ -347,6 +349,7 @@ def evaluate_population_on_boards(
     stagnation_grace_steps: int,
     stagnation_termination_steps: int,
     random_tie_break: bool,
+    revisit_penalty: float = REVISIT_PENALTY,
     executor: ProcessPoolExecutor | None = None,
     workers: int = 1,
 ) -> tuple[list[float], OutcomeCounts, list[float], list[tuple[str, ...]]]:
@@ -365,6 +368,7 @@ def evaluate_population_on_boards(
                 stagnation_penalty=stagnation_penalty,
                 stagnation_grace_steps=stagnation_grace_steps,
                 stagnation_termination_steps=stagnation_termination_steps,
+                revisit_penalty=revisit_penalty,
                 seed=layout_seed,
                 random_tie_break=random_tie_break,
             )
@@ -378,7 +382,7 @@ def evaluate_population_on_boards(
                     start, population[start:start + chunk_size], board,
                     timestep_limit, primitive_set, parsimony, stagnation_penalty,
                     stagnation_grace_steps, stagnation_termination_steps,
-                    layout_seed, random_tie_break,
+                    revisit_penalty, layout_seed, random_tie_break,
                 )
                 for start in range(0, len(population), chunk_size)
             )
@@ -597,6 +601,7 @@ def evolve(
                 stagnation_penalty=args.stagnation_penalty,
                 stagnation_grace_steps=args.stagnation_grace_steps,
                 stagnation_termination_steps=args.stagnation_termination_steps,
+                revisit_penalty=args.revisit_penalty,
                 random_tie_break=args.random_tie_break,
                 executor=executor,
                 workers=worker_count,
@@ -626,6 +631,7 @@ def evolve(
                     stagnation_penalty=args.stagnation_penalty,
                     stagnation_grace_steps=args.stagnation_grace_steps,
                     stagnation_termination_steps=args.stagnation_termination_steps,
+                    revisit_penalty=args.revisit_penalty,
                     random_tie_break=args.random_tie_break,
                     executor=executor,
                     workers=worker_count,
@@ -658,6 +664,7 @@ def evolve(
                 stagnation_penalty=args.stagnation_penalty,
                 stagnation_grace_steps=args.stagnation_grace_steps,
                 stagnation_termination_steps=args.stagnation_termination_steps,
+                revisit_penalty=args.revisit_penalty,
                 seed=args.seed,
                 random_tie_break=args.random_tie_break,
             )
@@ -758,6 +765,15 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--stagnation-penalty", type=float, default=100.0)
     parser.add_argument("--stagnation-grace-steps", type=int, default=0)
     parser.add_argument("--stagnation-termination-steps", type=int, default=50)
+    parser.add_argument(
+        "--revisit-penalty",
+        type=float,
+        default=REVISIT_PENALTY,
+        help=(
+            "extra cost when a non-scoring move returns to a tile visited in "
+            "the last VISIT_WINDOW steps (default: %(default)s)"
+        ),
+    )
     parser.add_argument("--min-initial-depth", type=int, default=2)
     parser.add_argument("--max-initial-depth", type=int, default=5)
     parser.add_argument("--max-evolved-depth", type=int, default=10)
@@ -787,6 +803,8 @@ def parse_args() -> argparse.Namespace:
 def validate_args(args: argparse.Namespace) -> None:
     if args.parsimony < 0:
         raise ValueError("parsimony must be nonnegative")
+    if args.revisit_penalty < 0:
+        raise ValueError("revisit-penalty must be nonnegative")
     if args.workers < 0:
         raise ValueError("workers must be nonnegative")
     if args.population_size < 1 or args.generations < 1:
@@ -829,7 +847,7 @@ def main() -> int:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output = args.output_directory or Path("runs") / f"board_graph_{timestamp}"
     output.mkdir(parents=True, exist_ok=True)
-    primitive_set = build_primitive_set(FEATURE_NAMES, constants=(-1, 0, 1))
+    primitive_set = build_primitive_set(FEATURE_NAMES)
     print(f"Run artifacts: {output}")
     print(f"Terminals: {', '.join(FEATURE_NAMES)}")
     print(f"Training boards per generation: {args.boards_per_generation}")
