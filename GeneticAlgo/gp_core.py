@@ -127,6 +127,167 @@ def build_move_primitive_set(
     return pset
 
 
+def _nest(tree: Sequence) -> tuple:
+    """Turn a prefix-ordered tree into nested ``(node, children)`` tuples."""
+    position = 0
+
+    def read() -> tuple:
+        nonlocal position
+        node = tree[position]
+        position += 1
+        return node, tuple(read() for _ in range(node.arity))
+
+    return read()
+
+
+def _flatten(nested: tuple, output: list) -> list:
+    node, children = nested
+    output.append(node)
+    for child in children:
+        _flatten(child, output)
+    return output
+
+
+def simplify_tree(tree: Sequence, pset: gp.PrimitiveSet) -> list:
+    """Return the nodes of ``tree`` with trivial chains collapsed.
+
+    Every rewrite gives the same value as the original for all finite inputs
+    (a signed zero may differ, which no primitive can observe), so behaviour is
+    unchanged and only the node count and depth shrink. The rules are:
+
+    - ``neg(neg x)``, ``abs(abs x)``, ``abs(neg x)``, ``abs(sqrt x)``,
+      ``abs(mul(x, x))``, ``sqrt(abs x)``, ``sqrt(neg x)`` (sqrt is of ``|x|``);
+    - identities: ``x + 0``, ``x - 0``, ``x * 1``, ``min(x, x)``, ``max(x, x)``;
+    - annihilators: ``x * 0``, ``x - x``, ``div(0, x)``;
+    - sign shuffles: ``x * -1``, ``0 - x``, ``a + neg b``, ``neg a + b``,
+      ``a - neg b``, ``neg(a - b)``, ``neg a * neg b``;
+    - ``if_lte`` with identical or constant conditions, or identical branches;
+    - any primitive whose arguments are all constants, when the result is one
+      of the primitive set's own constants.
+
+    ``div`` is otherwise left alone: its denominator floor and +/-1000 clamp
+    make ``x / 1`` and ``x / x`` inexact.
+    """
+    values = {
+        name: float(pset.context[name])
+        for name in pset.mapping
+        if name.startswith("constant_")
+    }
+    by_value: dict[float, tuple] = {}
+    for name, value in values.items():
+        by_value.setdefault(value, (pset.mapping[name], ()))
+
+    def make(name: str, *children: tuple) -> tuple:
+        return pset.mapping[name], children
+
+    def constant(nested: tuple) -> float | None:
+        return values.get(nested[0].name)
+
+    def is_op(nested: tuple, name: str) -> bool:
+        return nested[0].name == name
+
+    def rewrite(nested: tuple) -> tuple | None:
+        node, kids = nested
+        name = node.name
+        if not kids:
+            return None
+        numbers = [constant(kid) for kid in kids]
+        if all(number is not None for number in numbers):
+            try:
+                folded = float(pset.context[name](*numbers))
+            except (ArithmeticError, ValueError):
+                folded = None
+            if folded in by_value:
+                return by_value[folded]
+        if name == "neg":
+            (x,) = kids
+            if is_op(x, "neg"):
+                return x[1][0]
+            if is_op(x, "sub"):
+                return make("sub", x[1][1], x[1][0])
+        elif name == "abs":
+            (x,) = kids
+            if is_op(x, "abs") or is_op(x, "sqrt"):
+                return x
+            if is_op(x, "neg"):
+                return make("abs", x[1][0])
+            if is_op(x, "mul") and x[1][0] == x[1][1]:
+                return x
+        elif name == "sqrt":
+            (x,) = kids
+            if is_op(x, "abs") or is_op(x, "neg"):
+                return make("sqrt", x[1][0])
+        elif name == "add":
+            a, b = kids
+            if numbers[1] == 0.0:
+                return a
+            if numbers[0] == 0.0:
+                return b
+            if is_op(b, "neg"):
+                return make("sub", a, b[1][0])
+            if is_op(a, "neg"):
+                return make("sub", b, a[1][0])
+        elif name == "sub":
+            a, b = kids
+            if numbers[1] == 0.0:
+                return a
+            if a == b and 0.0 in by_value:
+                return by_value[0.0]
+            if numbers[0] == 0.0:
+                return make("neg", b)
+            if is_op(b, "neg"):
+                return make("add", a, b[1][0])
+        elif name == "mul":
+            a, b = kids
+            for number, other in ((numbers[0], b), (numbers[1], a)):
+                if number == 1.0:
+                    return other
+                if number == 0.0 and 0.0 in by_value:
+                    return by_value[0.0]
+                if number == -1.0:
+                    return make("neg", other)
+            if is_op(a, "neg") and is_op(b, "neg"):
+                return make("mul", a[1][0], b[1][0])
+        elif name == "div":
+            if numbers[0] == 0.0:
+                return kids[0]
+        elif name in ("min", "max"):
+            a, b = kids
+            if a == b:
+                return a
+        elif name == "if_lte":
+            a, b, then, otherwise = kids
+            if a == b or then == otherwise:
+                return then
+            if numbers[0] is not None and numbers[1] is not None:
+                return then if numbers[0] <= numbers[1] else otherwise
+        return None
+
+    def simplify(nested: tuple) -> tuple:
+        node, kids = nested
+        current = (node, tuple(simplify(kid) for kid in kids))
+        while True:
+            replacement = rewrite(current)
+            if replacement is None:
+                return current
+            # A rewrite can expose another one, so simplify its result again.
+            current = (
+                replacement[0],
+                tuple(simplify(kid) for kid in replacement[1]),
+            )
+
+    return _flatten(simplify(_nest(tree)), [])
+
+
+def repair_individual(individual: Individual, pset: gp.PrimitiveSet) -> Individual:
+    """Collapse trivial chains in place (see ``simplify_tree``)."""
+    nodes = simplify_tree(individual, pset)
+    if len(nodes) != len(individual):
+        # PrimitiveTree only accepts slices with explicit bounds.
+        individual[slice(0, len(individual))] = nodes
+    return individual
+
+
 def build_toolbox(
     primitive_set: gp.PrimitiveSet,
     min_depth: int,

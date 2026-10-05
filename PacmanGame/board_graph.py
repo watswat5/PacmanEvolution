@@ -18,7 +18,7 @@ ACTIONS = ("up", "down", "left", "right")
 DIRECTIONS = {"up": (0, -1), "down": (0, 1), "left": (-1, 0), "right": (1, 0)}
 REVERSE_DIRECTION = {"up": "down", "down": "up", "left": "right", "right": "left"}
 GHOST_KEYS = ("blinky_pos", "pinky_pos", "inky_pos", "clyde_pos")
-DEFAULT_POWERUP_DURATION = 40
+DEFAULT_POWERUP_DURATION = 52
 # Tile-path radius used by ``danger_ghosts_nearby``.
 GHOST_NEAR_RADIUS = 8
 # Pac-Man steps that ``recently_visited`` remembers (also the trainer's
@@ -27,7 +27,8 @@ VISIT_WINDOW = 12
 
 # Every value is bounded: distances are normalized to [0, 1) with exactly 1.0
 # meaning "no such target / unreachable", flags and fractions lie in [0, 1],
-# and ``pellet_center_direction`` lies in [-1, 1].
+# and ``pellet_center_direction`` and ``junction_ghost_margin`` lie in [-1, 1].
+# Append new names at the end so previously pickled trees keep working.
 MOVE_FEATURE_NAMES = (
     "pellet_here",
     "pellet_distance",
@@ -46,6 +47,8 @@ MOVE_FEATURE_NAMES = (
     "dead_end_depth",
     "recently_visited",
     "pellet_center_direction",
+    "junction_ghost_margin",
+    "safe_escape_options",
 )
 LayoutKey = tuple[tuple[bool, ...], ...]
 
@@ -93,6 +96,11 @@ class StaticBoardGraph:
             for key, path in self.corridors.items()
         })
         self.pocket_depths = MappingProxyType(self._build_pocket_depths())
+        # For each move: the corridors that continue from where its corridor
+        # ends (excluding the way back), as (far junction id, length) pairs.
+        self.corridor_continuations = MappingProxyType(
+            self._build_corridor_continuations()
+        )
 
     def _destination(self, point: Point, direction: str) -> Point | None:
         dx, dy = DIRECTIONS[direction]
@@ -146,6 +154,21 @@ class StaticBoardGraph:
                 result[(origin, action)] = tuple(path)
         return result
 
+    def _build_corridor_continuations(
+        self,
+    ) -> dict[tuple[Point, str], tuple[tuple[int, int], ...]]:
+        result = {}
+        for (origin, action), path in self.corridors.items():
+            junction = path[-1]
+            came_from = path[-2] if len(path) > 1 else origin
+            result[(origin, action)] = tuple(
+                (self.point_ids[onward[-1]], len(onward))
+                for onward_action, first in self.neighbors[junction].items()
+                if first != came_from
+                for onward in (self.corridors[(junction, onward_action)],)
+            )
+        return result
+
     def _build_pocket_depths(self) -> dict[tuple[Point, str], int]:
         """Depth of the dead-end pocket each move enters, or 0 if none.
 
@@ -196,7 +219,15 @@ def _layout_key(board: GameBoard) -> LayoutKey:
     return tuple(tuple(bool(value & blocked) for value in row) for row in board.tiles)
 
 
-@lru_cache(maxsize=None)
+# Bounded: each graph is about 1.8 MB, and training sees new boards every
+# generation, so an unbounded cache grew by hundreds of megabytes per worker
+# over a run. 32 covers the boards in use at once (training boards, the 10
+# tournament boards and the validation board); older layouts are recomputed
+# in about 0.05 s if they ever come back.
+STATIC_GRAPH_CACHE_SIZE = 32
+
+
+@lru_cache(maxsize=STATIC_GRAPH_CACHE_SIZE)
 def _precompute_layout(layout: LayoutKey) -> StaticBoardGraph:
     return StaticBoardGraph(layout)
 
@@ -295,14 +326,29 @@ class ObservationProvider:
         move_x, move_y = DIRECTIONS[action]
         return (move_x * dx + move_y * dy) / magnitude
 
-    def _sync_ghosts(self, board: GameBoard) -> tuple[Point, ...]:
-        positions = tuple(getattr(board, key) for key in GHOST_KEYS)
-        signature = (board.player_powerup, positions)
-        if signature != self._ghost_signature:
-            self._ghost_signature = signature
+    def _sync_ghosts(
+        self, board: GameBoard
+    ) -> tuple[tuple[Point, ...], tuple[Point, ...]]:
+        """Return the (dangerous, edible) ghost positions for this state.
+
+        Ghosts are scared one by one (``Board.ghost_scared``): one that was
+        eaten and has returned is dangerous while the others are still edible.
+        """
+        scared = board.ghost_scared
+        danger = tuple(
+            getattr(board, key) for key in GHOST_KEYS
+            if not scared[key.removesuffix("_pos")]
+        )
+        edible = tuple(
+            getattr(board, key) for key in GHOST_KEYS
+            if scared[key.removesuffix("_pos")]
+        )
+        roles = (danger, edible)
+        if roles != self._ghost_signature:
+            self._ghost_signature = roles
             self._distance_cache.pop("danger_ghost", None)
             self._distance_cache.pop("edible_ghost", None)
-        return positions
+        return roles
 
     def _distance_map(self, sources: Iterable[Point]) -> dict[Point, int]:
         distances = {point: self.unreachable_distance for point in self.static.points}
@@ -329,15 +375,16 @@ class ObservationProvider:
         }
 
     def distance_map(self, target: str, board: GameBoard) -> Mapping[Point, int]:
-        ghosts = self._sync_ghosts(board)
+        danger, edible = self._sync_ghosts(board)
         if target not in self._distance_cache:
             if target == "pellet":
                 distances = self._distance_map(self._pellets)
             elif target == "power_pellet":
                 distances = self._distance_map(self._power_pellets)
             elif target in {"danger_ghost", "edible_ghost"}:
-                wanted = (target == "edible_ghost") == board.player_powerup
-                distances = self._ghost_distance_map(ghosts if wanted else ())
+                distances = self._ghost_distance_map(
+                    edible if target == "edible_ghost" else danger
+                )
             else:
                 raise ValueError(f"unknown distance-map target {target!r}")
             self._distance_cache[target] = MappingProxyType(distances)
@@ -345,6 +392,41 @@ class ObservationProvider:
 
     def _ghost_distances(self, candidate: Point, ghosts: tuple[Point, ...]) -> list[int]:
         return sorted(self.static.distance(candidate, ghost) for ghost in ghosts)
+
+    def _junction_safety(
+        self, key: tuple[Point, str], ghosts: tuple[Point, ...]
+    ) -> tuple[float, float]:
+        """Race the dangerous ghosts to the end of a move's corridor.
+
+        Returns ``(junction_ghost_margin, safe_escape_options)``. The margin is
+        the nearest ghost's path distance to the corridor's end minus
+        Pac-Man's, normalized and clamped to [-1, 1]; zero or less means a
+        ghost gets there first (a tie loses because Pac-Man moves first and the
+        ghost then steps onto him). The second value counts the onward
+        corridors whose far junction Pac-Man also reaches strictly first,
+        divided by 3. Path distances ignore that ghosts cannot reverse, so both
+        values err towards caution.
+        """
+        static = self.static
+        corridor = static.corridors[key]
+        continuations = static.corridor_continuations[key]
+        ghost_rows = [
+            static.distances[ghost_id]
+            for ghost_id in (static.point_ids.get(ghost) for ghost in ghosts)
+            if ghost_id is not None
+        ]
+        if not ghost_rows:
+            return 1.0, len(continuations) / 3.0
+        steps = len(corridor)
+        junction_id = static.point_ids[corridor[-1]]
+        margin = min(row[junction_id] for row in ghost_rows) - steps
+        safe = 0
+        if margin > 0:
+            safe = sum(
+                min(row[far_id] for row in ghost_rows) > steps + length
+                for far_id, length in continuations
+            )
+        return max(-1.0, min(1.0, margin / self.distance_scale)), safe / 3.0
 
     def _normalized_distance(self, distance: int) -> float:
         if distance >= self.unreachable_distance:
@@ -354,8 +436,7 @@ class ObservationProvider:
     def for_legal_moves(
         self, board: GameBoard, last_direction: str
     ) -> dict[str, dict[str, float]]:
-        ghosts = self._sync_ghosts(board)
-        frightened = board.player_powerup
+        danger_ghosts, edible_ghosts = self._sync_ghosts(board)
         pellet_distances = self.distance_map("pellet", board)
         power_distances = self.distance_map("power_pellet", board)
         frightened_time = min(1.0, board.player_powerup_turns / self.powerup_duration)
@@ -368,9 +449,9 @@ class ObservationProvider:
                 continue
             key = (board.player_pos, action)
             corridor = self.static.corridors[key]
-            ghost_distances = self._ghost_distances(candidate, ghosts)
-            danger = [] if frightened else ghost_distances
-            edible = ghost_distances if frightened else []
+            danger = self._ghost_distances(candidate, danger_ghosts)
+            edible = self._ghost_distances(candidate, edible_ghosts)
+            junction_margin, safe_exits = self._junction_safety(key, danger_ghosts)
             result[action] = {
                 "pellet_here": float(candidate in self._pellets),
                 "pellet_distance": self._normalized_distance(
@@ -411,5 +492,7 @@ class ObservationProvider:
                 "pellet_center_direction": self._pellet_center_alignment(
                     board.player_pos, action
                 ),
+                "junction_ghost_margin": junction_margin,
+                "safe_escape_options": safe_exits,
             }
         return result

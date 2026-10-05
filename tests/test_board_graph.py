@@ -29,7 +29,7 @@ class BoardGraphTests(unittest.TestCase):
             self.assertTrue(all(
                 value >= 0
                 for name, value in features.items()
-                if name != "pellet_center_direction"
+                if name not in {"pellet_center_direction", "junction_ghost_margin"}
             ))
             self.assertGreaterEqual(features["pellet_center_direction"], -1.0)
             self.assertLessEqual(features["pellet_center_direction"], 1.0)

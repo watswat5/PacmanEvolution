@@ -33,6 +33,7 @@ GRAPHICS_DIR = SCRIPT_DIR / "graphics"
 POSITION_KEYS = ("player_pos", "inky_pos", "blinky_pos", "pinky_pos", "clyde_pos")
 MOVE_KEYS = ("up", "down", "left", "right")
 PLAYER_DIRECTION_KEYS = tuple(f"player_{key}" for key in MOVE_KEYS)
+SCARED_KEYS = ("inky_scared", "blinky_scared", "pinky_scared", "clyde_scared")
 
 
 def _parse_position(path: Path, key: str, value: str) -> tuple[int, int]:
@@ -95,7 +96,7 @@ def read_board(path: Path) -> GameBoard:
     optional_settings = {
         "player_powerup_turns", "game_turn", "score", "game_over",
         "pellets_eaten", "pellets_remaining",
-        *MOVE_KEYS, *PLAYER_DIRECTION_KEYS,
+        *MOVE_KEYS, *PLAYER_DIRECTION_KEYS, *SCARED_KEYS,
     }
     missing = required_settings - settings.keys()
     unknown = settings.keys() - required_settings - optional_settings
@@ -120,6 +121,18 @@ def read_board(path: Path) -> GameBoard:
         raise ValueError(
             f"{path}: player_powerup must be true exactly when player_powerup_turns is positive"
         )
+    # Per-ghost scared flags are optional; a missing one follows player_powerup.
+    scared: dict[str, bool | None] = {}
+    for key in SCARED_KEYS:
+        text = settings.get(key)
+        if text is None:
+            scared[key] = None
+            continue
+        if text.lower() not in {"true", "false"}:
+            raise ValueError(f"{path}: {key} must be true or false")
+        scared[key] = text.lower() == "true"
+        if scared[key] and powerup_text != "true":
+            raise ValueError(f"{path}: {key} requires player_powerup to be true")
     try:
         game_turn = int(settings.get("game_turn", "0"))
     except ValueError as exc:
@@ -207,17 +220,16 @@ def read_board(path: Path) -> GameBoard:
         if rows[y][x] & WALL:
             raise ValueError(f"{path}: {key} {(x, y)} is inside a wall")
 
+    # Ghosts may share a tile, as in the arcade game.
     ghost_positions = [positions[key] for key in POSITION_KEYS if key != "player_pos"]
-    if len(set(ghost_positions)) != len(ghost_positions):
-        raise ValueError(f"{path}: ghost positions must be unique")
     player_collisions = sum(
         point == positions["player_pos"] for point in ghost_positions
     )
     if player_collisions and not game_over:
         raise ValueError(f"{path}: player and ghost may overlap only when game_over is true")
-    if game_over and player_collisions != 1:
+    if game_over and not player_collisions:
         raise ValueError(
-            f"{path}: game_over state must have exactly one ghost overlapping the player"
+            f"{path}: game_over state must have a ghost overlapping the player"
         )
 
     actual_pellets_remaining = sum(
@@ -251,6 +263,7 @@ def read_board(path: Path) -> GameBoard:
         pellets_remaining=pellets_remaining,
         **provided_direction,
         **positions,
+        **scared,
     )
     computed_moves = _player_move_flags(board)
     for key, value in provided_moves.items():
@@ -275,6 +288,10 @@ def write_board(board: GameBoard, path: Path) -> None:
         f"blinky_pos = {board.blinky_pos}",
         f"pinky_pos = {board.pinky_pos}",
         f"clyde_pos = {board.clyde_pos}",
+        *(
+            f"{name}_scared = {str(value).lower()}"
+            for name, value in board.ghost_scared.items()
+        ),
         f"up = {str(move_flags['up']).lower()}",
         f"down = {str(move_flags['down']).lower()}",
         f"left = {str(move_flags['left']).lower()}",
@@ -377,11 +394,12 @@ def render_board(board: GameBoard) -> Image.Image:
                     )
 
     # Entities are independent of tile flags and always render on top.
+    ghost_scared = board.ghost_scared
     for key in POSITION_KEYS:
         x, y = getattr(board, key)
         sprite = (
             scared_ghost
-            if key != "player_pos" and board.player_powerup
+            if key != "player_pos" and ghost_scared[key.removesuffix("_pos")]
             else entity_sprites[key]
         )
         image.alpha_composite(sprite, (x * tile_width, y * tile_height))

@@ -11,6 +11,7 @@ from GeneticAlgo.train_board_graph import (
 )
 from PacmanGame import Board, MOVE_FEATURE_NAMES, PacmanGame
 from PacmanGame.board_graph import GHOST_NEAR_RADIUS, VISIT_WINDOW
+from PacmanGame.pacman import POWERUP_DURATION
 from PacmanGame.render_board import PELLET, WALL
 
 # A loop (rows 1-3) with a two-tile dead end hanging below (3, 3).
@@ -44,7 +45,8 @@ class MoveFeatureTests(unittest.TestCase):
         for features in observations.values():
             self.assertEqual(tuple(features), MOVE_FEATURE_NAMES)
             for name, value in features.items():
-                low = -1.0 if name == "pellet_center_direction" else 0.0
+                signed = {"pellet_center_direction", "junction_ghost_margin"}
+                low = -1.0 if name in signed else 0.0
                 self.assertGreaterEqual(value, low, name)
                 self.assertLessEqual(value, 1.0, name)
 
@@ -76,6 +78,47 @@ class MoveFeatureTests(unittest.TestCase):
         self.assertEqual(left["edible_ghost_distance"], 1.0)
         self.assertEqual(left["frightened_time"], 0.0)
 
+    def test_junction_ghost_margin_and_safe_escape_options(self) -> None:
+        # Two rows joined by a middle rung; the right move from (2, 1) ends at
+        # the junction (4, 1), which continues right (8 tiles) and down (2).
+        layout = (
+            "#########",
+            "#.......#",
+            "#.##.##.#",
+            "#.......#",
+            "#########",
+        )
+        tiles = [[WALL if c == "#" else PELLET for c in row] for row in layout]
+
+        def features(ghost, **changes):
+            board = Board(
+                tiles=[row.copy() for row in tiles], player_pos=(2, 1),
+                player_powerup=False, player_powerup_turns=0, game_turn=0,
+                score=0, game_over=False, inky_pos=ghost, blinky_pos=ghost,
+                pinky_pos=ghost, clyde_pos=ghost, pellets_remaining=19,
+            )
+            game = PacmanGame(board.copy(**changes) if changes else board)
+            return game.get_move_observations(), game._observation_provider.distance_scale
+
+        # Chasing from behind: Pac-Man reaches (4, 1) one step ahead, and only
+        # the short rung down gets him to the next junction first.
+        moves, scale = features((1, 1))
+        self.assertAlmostEqual(moves["right"]["junction_ghost_margin"], 1 / scale)
+        self.assertAlmostEqual(moves["right"]["safe_escape_options"], 1 / 3)
+        self.assertAlmostEqual(moves["right"]["escape_options"], 2 / 3)
+        # A ghost waiting on the junction: it gets there first, nothing is safe.
+        moves, scale = features((4, 1))
+        self.assertAlmostEqual(moves["right"]["junction_ghost_margin"], -2 / scale)
+        self.assertEqual(moves["right"]["safe_escape_options"], 0.0)
+        # A ghost beside the far junction: (4, 1) is reachable but a trap.
+        moves, scale = features((5, 3))
+        self.assertAlmostEqual(moves["right"]["junction_ghost_margin"], 1 / scale)
+        self.assertEqual(moves["right"]["safe_escape_options"], 0.0)
+        # Powered up: no danger, so every exit counts.
+        moves, _ = features((4, 1), player_powerup=True, player_powerup_turns=20)
+        self.assertEqual(moves["right"]["junction_ghost_margin"], 1.0)
+        self.assertAlmostEqual(moves["right"]["safe_escape_options"], 2 / 3)
+
     def test_frightened_swaps_danger_for_edible(self) -> None:
         board = make_board(player_powerup=True, player_powerup_turns=20)
         left = PacmanGame(board).get_move_observations()["left"]
@@ -83,7 +126,7 @@ class MoveFeatureTests(unittest.TestCase):
         self.assertEqual(left["second_danger_ghost_distance"], 1.0)
         self.assertEqual(left["danger_ghosts_nearby"], 0.0)
         self.assertLess(left["edible_ghost_distance"], 1.0)
-        self.assertEqual(left["frightened_time"], 0.5)
+        self.assertEqual(left["frightened_time"], 20 / POWERUP_DURATION)
 
     def test_recently_visited_marks_tiles_just_left(self) -> None:
         game = PacmanGame(make_board())

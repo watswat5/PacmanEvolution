@@ -38,6 +38,14 @@ class Board:
     player_right: bool = False
     pellets_eaten: int = 0
     pellets_remaining: int = 0
+    # Per-ghost frightened ("scared") status. ``None`` means unspecified, in
+    # which case the ghost is scared exactly when ``player_powerup`` is set;
+    # the game always stores explicit values, because a ghost that was eaten
+    # and has returned is dangerous while the others are still scared.
+    inky_scared: bool | None = None
+    blinky_scared: bool | None = None
+    pinky_scared: bool | None = None
+    clyde_scared: bool | None = None
 
     @property
     def width(self) -> int:
@@ -59,6 +67,19 @@ class Board:
             "blinky": self.blinky_pos,
             "pinky": self.pinky_pos,
             "clyde": self.clyde_pos,
+        }
+
+    @property
+    def ghost_scared(self) -> dict[str, bool]:
+        """Whether each ghost can currently be eaten, with ``None`` resolved."""
+        return {
+            name: self.player_powerup if value is None else value
+            for name, value in (
+                ("inky", self.inky_scared),
+                ("blinky", self.blinky_scared),
+                ("pinky", self.pinky_scared),
+                ("clyde", self.clyde_scared),
+            )
         }
 
     @property

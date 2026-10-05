@@ -1,0 +1,63 @@
+# Python bytecode and test/tool caches
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+htmlcov/
+
+# Virtual environments and local environment files
+.venv/
+venv/
+ENV/
+.env
+.env.*
+!.env.example
+
+# Experiment outputs, runs, and model checkpoints
+runs/
+run/
+checkpoints/
+checkpoint/
+checkpoints_*/
+Autoencoder/training_*/
+GeneticAlgo/training_*/
+gp_*.csv
+history.csv
+*.keras
+long_best_*.mp4
+*_graphs.png
+PacmanGame/generated_board.*
+PacmanGame/test_board.*
+Autoencoder/encoding_visualization_*.png
+*.ckpt
+*.checkpoint
+*.pt
+*.pth
+*.model
+*.pkl
+*.pickle
+*.npz
+*.npy
+*.log
+
+# Common generated/build output
+build/
+dist/
+*.egg-info/
+target/
+
+# Editor and operating-system files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# Charts copied out of run folders
+Claude outputs/

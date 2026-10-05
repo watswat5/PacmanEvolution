@@ -1,0 +1,7 @@
+[Desktop Entry]
+Type=Application
+Name=Play Pac-Man individual
+Comment=Drop a saved tree (.pkl) here to watch it play the original maze
+Exec=env PLAY_WAIT=1 "/home/chris/Documents/Shared/School/Fall 2026/Evo Algo/Final Project/play_individual.sh" %F
+Terminal=true
+Icon=applications-games

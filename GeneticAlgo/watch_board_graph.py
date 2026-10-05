@@ -25,6 +25,7 @@ def main():
         individual = pickle.load(handle)
     pset = build_primitive_set()
     game, rng = PacmanGame(read_board(args.board)), random.Random(args.seed)
+    starting_pellets = game.board.pellets_remaining
     frame = rendered_frame(game, args.scale)
     writer = open_video_writer(args.video, frame.width, frame.height, args.fps)
     assert writer.stdin is not None
@@ -39,6 +40,12 @@ def main():
         if not writer.stdin.closed: writer.stdin.close()
     code = writer.wait()
     if code: raise SystemExit(f"ffmpeg exited with status {code}")
+    eaten = starting_pellets - game.board.pellets_remaining
+    outcome = "cleared the board" if game.won else "died" if game.game_over else "ran out of steps"
+    print(
+        f"Result: {outcome} after {steps} steps; ate {eaten} of {starting_pellets} "
+        f"pellets ({eaten / max(1, starting_pellets):.1%})"
+    )
     print(f"Saved {steps + 1} frames ({steps} steps) to {args.video} at {args.fps:g} fps")
     return 0
 
