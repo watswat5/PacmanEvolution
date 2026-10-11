@@ -37,12 +37,17 @@ if [[ "${BOARD_GRAPH_DETACHED:-}" != 1 ]]; then
   exit 0
 fi
 
-source GeneticAlgo/.venv/bin/activate
+# BOARD_GRAPH_ADD_FEATURES: terminals added to the original 19. Default
+# "all,pellets_left,safe_pellet_distance,ghost_path_conflict" (every optional feature); "" for
+# the original 19 only. A resumed run must use the value it was started with.
+# BOARD_GRAPH_VENV=GeneticAlgo/.venv-pypy trains under PyPy (see check_pypy.sh).
+source "${BOARD_GRAPH_VENV:-GeneticAlgo/.venv}/bin/activate"
 
 exec python -u -m GeneticAlgo.train_board_graph \
   --evolution-method cellular \
   --population-size 64 \
   --generations 50 \
+  --add-features "${BOARD_GRAPH_ADD_FEATURES-all,pellets_left,safe_pellet_distance,ghost_path_conflict,blinky_distance,elroy,safe_power_pellet_distance,onward_safe_exits}" \
   --boards-per-generation "${BOARD_GRAPH_BOARDS_PER_GENERATION:-8}" \
   --boards-replaced-per-generation "${BOARD_GRAPH_BOARDS_REPLACED:-2}" \
   --timestep-limit 1000 \

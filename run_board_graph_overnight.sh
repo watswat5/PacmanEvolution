@@ -7,18 +7,27 @@ cd "$(dirname "$0")"
 # fresh population, which explores more than one very long run because a run
 # commits to one family of trees early.
 #
-# Evolution is cellular (a 20x20 toroidal grid by default): a child replaces
+# Evolution is cellular (a 20x40 toroidal grid by default): a child replaces
 # its parent only if it scores higher on the same boards, so good trees are
 # never lost. BOARD_GRAPH_POPULATION changes the grid size.
 #
 #   BOARD_GRAPH_SEEDS="42 43 44 45 46"   seeds to run, in order
-#   BOARD_GRAPH_GENERATIONS=400          generations per seed
+#   BOARD_GRAPH_GENERATIONS=50000        generations per seed
 #   BOARD_GRAPH_RESUME=runs/<directory>  continue an earlier overnight run
+#   BOARD_GRAPH_SAVE_INTERVAL=100        keep generation_NNNN_best.pkl and the
+#                                        layouts every N-th generation only
+#   BOARD_GRAPH_ADD_FEATURES=all,pellets_left,safe_pellet_distance,ghost_path_conflict
+#                                        terminals added to the original 19: "all"
+#                                        is the three evasion features
+#                                        (danger_ghost_approaching, pincer,
+#                                        safe_territory), pellets_left the share of
+#                                        pellets still uneaten, then the two
+#                                        endgame cues; "" for none
 #
 # Every seed saves a checkpoint after each generation, so after a crash or a
 # reboot, rerun with BOARD_GRAPH_RESUME set: finished seeds are skipped and the
 # interrupted one continues where it stopped.
-seeds=${BOARD_GRAPH_SEEDS:-"42 43 44 45 46"}
+seeds=${BOARD_GRAPH_SEEDS:-"42"}
 
 if [[ "${BOARD_GRAPH_DETACHED:-}" != 1 ]]; then
   mkdir -p runs
@@ -63,7 +72,8 @@ if [[ "${BOARD_GRAPH_DETACHED:-}" != 1 ]]; then
   exit 0
 fi
 
-source GeneticAlgo/.venv/bin/activate
+# BOARD_GRAPH_VENV=GeneticAlgo/.venv-pypy trains under PyPy (see check_pypy.sh).
+source "${BOARD_GRAPH_VENV:-GeneticAlgo/.venv}/bin/activate"
 
 # Detached seed loop. This shell ignores Ctrl-C (it was started in the
 # background), so the launcher signals USR1 instead. The trainer runs as a
@@ -87,9 +97,11 @@ for seed in $seeds; do
     --resume \
     --evolution-method cellular \
     --cellular-tournament-size 3 \
-    --population-size "${BOARD_GRAPH_POPULATION:-400}" \
-    --generations "${BOARD_GRAPH_GENERATIONS:-400}" \
-    --boards-per-generation "${BOARD_GRAPH_BOARDS_PER_GENERATION:-8}" \
+    --population-size "${BOARD_GRAPH_POPULATION:-800}" \
+    --generations "${BOARD_GRAPH_GENERATIONS:-50000}" \
+    --save-interval "${BOARD_GRAPH_SAVE_INTERVAL:-100}" \
+    --add-features "${BOARD_GRAPH_ADD_FEATURES-all,pellets_left,safe_pellet_distance,ghost_path_conflict,blinky_distance,elroy,safe_power_pellet_distance,onward_safe_exits}" \
+    --boards-per-generation "${BOARD_GRAPH_BOARDS_PER_GENERATION:-5}" \
     --boards-replaced-per-generation "${BOARD_GRAPH_BOARDS_REPLACED:-2}" \
     --timestep-limit 1000 \
     --stagnation-penalty "${BOARD_GRAPH_STAGNATION_PENALTY:-20}" \
@@ -97,10 +109,10 @@ for seed in $seeds; do
     --stagnation-termination-steps 50 \
     --min-initial-depth 2 \
     --max-initial-depth 8 \
-    --max-evolved-depth 16 \
-    --crossover-probability 0.70 \
-    --mutation-probability 0.30 \
-    --top-fraction 0.50 \
+    --max-evolved-depth 24 \
+    --crossover-probability 0.90 \
+    --mutation-probability 0.10 \
+    --top-fraction 0.30 \
     --top-probability 0.80 \
     --size-penalty "${BOARD_GRAPH_SIZE_PENALTY:-10}" \
     --parsimony 1.0 \

@@ -1,6 +1,6 @@
 # Experiment log
 
-History of the Pac-Man GP experiments through 4 Oct 2026, compiled from the run
+History of the Pac-Man GP experiments through 9 Oct 2026, compiled from the run
 folders, CSV histories, run scripts, git history and `AGENTS.md`.
 
 **Fitness numbers are not comparable across phases.** The fitness formula and
@@ -114,6 +114,14 @@ the formula.
 
 Tournament and validation games use the run's own rules, so 10-board fitness
 is not comparable between these conditions. Compare on fresh boards.
+
+### Phase 10: evasion experiment (prepared 9 Oct, not yet run)
+
+Fitness formula unchanged from Phase 9's baseline (depth limit 20). What
+changes is what the tree can see: one or all of three new terminals
+(`danger_ghost_approaching`, `pincer`, `safe_territory`; definitions in
+AGENTS.md, "Shared-tree observation contract"). Training and tournament fitness
+are therefore comparable between all conditions. Confidence: from code.
 
 ### What changed, at a glance
 
@@ -391,9 +399,74 @@ Limits known in advance:
 
 Results: none yet.
 
+### Phase 10: evasion experiment (prepared 9 Oct, not yet run); `runs/experiment_evasion`
+
+Why: the 50,000-generation overnight run (`board_graph_overnight_20261009_001834_Y6qOm1`,
+FastCore, 800 trees, depth 24) levelled off within the first few thousand
+generations. Over the whole run, 60-65% of its training games ended in death,
+about 22% in a clear and about 15% in stagnation (`plot_cdst.py`); its
+generation champions died on about half of their validation boards. Dying is
+the main failure, so this phase gives the trees cues a human player uses to
+evade:
+
+- `danger_ghost_approaching`: is the nearest dangerous ghost coming towards the
+  candidate tile or moving away (ghosts cannot reverse)?
+- `pincer`: does the move head at one ghost while another closes from behind?
+- `safe_territory`: how much of the maze can Pac-Man reach before any ghost
+  after this move? It generalises `junction_ghost_margin`, which looks one
+  junction ahead.
+
+Design: baseline (the original 19 terminals) plus one condition per feature
+and one with all three; nothing else changes. Cellular 20x20, depth 20, 1000
+generations, seeds 42 43 44, seeds as the outer loop
+(`FastCore/run_board_graph_evasion_experiment.sh`).
+
+How it will be judged: each run's champion on 30 fresh boards, by deaths first,
+then clears and pellets (`summarize_experiments.py --fresh-boards 30`), plus
+`champion_curves.py` over generations.
+
+Limits known in advance:
+
+- Three seeds can only show a large effect.
+- More terminals make the search space larger; a feature can help a human and
+  still slow evolution down at 1000 generations.
+- The features use path distances and ignore ghost speeds, so
+  `safe_territory` and `pincer` err towards caution.
+- Speed: after the 9 Oct fix, a tree using `safe_territory` plays about 15%
+  slower; the other two features cost nothing measurable.
+
+**First result (one seed, not the five-condition experiment).** The overnight
+script with all three features on (`board_graph_overnight_20261009_154225_r1Vtux`, seed 42) against the 50k
+baseline run `board_graph_overnight_20261009_001834_Y6qOm1`: same seed, boards
+and settings (800 trees, 20x40 grid, depth 24), only the terminals differ.
+Both runs plateau around generation 1000.
+
+| | Baseline | Evasion |
+| --- | --- | --- |
+| Population training games, generations 1000-2783: cleared / died / stagnated | 15.7 / 66.6 / 17.6% | 26.9 / 59.4 / 13.7% |
+| Average training fitness, same generations | 78,000 | 85,900 |
+| Best 10-board so far (by generation 2783) | 111,243 | 116,068 |
+
+Generation champions on 100 fresh boards (seeds 9000-9099, C++ engine):
+
+| Generation | Baseline: pellets, cleared, died | Evasion: pellets, cleared, died |
+| --- | --- | --- |
+| 999 | 84.8%, 9, 77 | 88.0%, 25, 63 |
+| 1999 | 89.5%, 9, 73 | 89.3%, 29, 57 |
+| 2699 | 88.7%, 8, 77 | 90.0%, 23, 58 |
+
+- The features roughly triple the clear rate (8-9 to 23-29 per 100 fresh
+  boards) and cut deaths by 15-20 per 100; pellets barely change.
+- Every evasion champion uses `pincer` and `safe_territory`; none uses
+  `danger_ghost_approaching`.
+- The plateau is not removed: the evasion run levels off at the same point,
+  just higher.
+- One seed only; the five-condition experiment (three seeds, each feature
+  alone) is still to run.
+
 ## Open points
 
-- Reliable clearing is not reached: the playoff winner clears 6 of 100 fresh boards, and no run or setting so far has moved that rate (Phase 8). Phase 9 tests three candidate changes.
+- Reliable clearing is not reached: the playoff winner clears 6 of 100 fresh boards, and no run or setting so far has moved that rate (Phase 8). Phase 9 tests three candidate changes. Deaths are the main failure (60-65% of training games over a 50,000-generation run). Phase 10's evasion features about tripled fresh-board clears in one seed (8-9 to 23-29 per 100), but the run still plateaus near generation 1000.
 - Separate seeds plateau at about generation 200-265; islands were still improving slowly at 300. Not yet compared at equal generations.
 - The ablation is underpowered for small effects: three seeds per condition against a seed spread of 10,000 to 31,000. Settling the mid-table conditions would take roughly 8 to 10 seeds each.
 - The tournament score overstates generalisation. Fresh-board results should be the headline comparison in any write-up.

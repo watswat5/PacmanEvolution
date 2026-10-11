@@ -5,7 +5,7 @@ import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from deap import gp
 from GeneticAlgo import train_board_graph  # registers DEAP pickle types
-from GeneticAlgo.train_board_graph import FEATURE_NAMES
+from GeneticAlgo.train_board_graph import MOVE_FEATURE_NAMES as FEATURE_NAMES
 
 source, output, best = map(Path, sys.argv[1:4])
 with source.open(newline="", encoding="utf-8") as handle:
@@ -14,23 +14,42 @@ if not rows:
     raise ValueError(f"{source} has no data rows")
 data = {key: [float(row[key]) for row in rows] for key in rows[0]}
 x = data["generation"]
+# Long runs (thousands of generations) are unreadable as raw lines, so each
+# noisy series is drawn faint and a rolling mean on top. Short runs are drawn
+# as before. BOARD_GRAPH_PLOT_WINDOW overrides the window (1 = raw only).
+import os
+window = int(os.environ.get("BOARD_GRAPH_PLOT_WINDOW", "0") or 0) or (
+    1 if len(x) <= 2000 else max(2, len(x) // 250)
+)
+def rolling(values):
+    import numpy as np
+    values = np.asarray(values, dtype=float)
+    sums = np.cumsum(np.insert(values, 0, 0.0))
+    mean = (sums[window:] - sums[:-window]) / window
+    return x[window // 2: window // 2 + len(mean)], mean
+def series(axis, key, label, **style):
+    if window == 1:
+        return axis.plot(x, data[key], label=label, **style)
+    line, = axis.plot(*rolling(data[key]), label=label, **style)
+    axis.plot(x, data[key], color=line.get_color(), alpha=0.12, linewidth=0.4, zorder=0)
 plt.style.use("seaborn-v0_8-whitegrid")
 fig, axes = plt.subplots(3, 1, figsize=(13, 12), sharex=True, constrained_layout=True)
 for label, key in (("Best", "best_fitness"), ("Average", "average_fitness"), ("Worst", "worst_fitness")):
-    axes[0].plot(x, data[key], label=label)
+    series(axes[0], key, label)
 if "validation_fitness" in data:
-    axes[0].plot(
-        x, data["validation_fitness"], label="Champion validation",
-        color="#111827", linewidth=2.5, linestyle="--",
+    series(
+        axes[0], "validation_fitness", "Champion validation",
+        color="#111827", linewidth=2.0, linestyle="--",
     )
 if "best_validation_fitness_so_far" in data:
     axes[0].plot(
         x, data["best_validation_fitness_so_far"],
         label="Best validation so far", color="#16a34a", linewidth=2.5,
     )
-axes[0].set(title="Fitness", ylabel="Fitness score"); axes[0].legend()
+smoothed = "" if window == 1 else f" (lines: {window}-generation rolling mean; faint: raw)"
+axes[0].set(title="Fitness" + smoothed, ylabel="Fitness score"); axes[0].legend(loc="lower right")
 for axis, avg, champion, title in ((axes[1], "average_tree_depth", "best_tree_depth", "Tree Depth"), (axes[2], "average_node_count", "best_node_count", "Node Count")):
-    axis.plot(x, data[avg], label="Average"); axis.plot(x, data[champion], label="Best")
+    series(axis, avg, "Average"); series(axis, champion, "Best")
     axis.set_title(title); axis.legend()
 axes[2].set_xlabel("Generation")
 metrics = output / "training_metrics.png"
@@ -52,7 +71,7 @@ def place(node, depth):
     positions[node] = (x, -depth)
     return x
 place(0, 0)
-terminal_colors = dict(zip(FEATURE_NAMES, plt.get_cmap("tab20").colors))
+terminal_colors = dict(zip(FEATURE_NAMES, plt.get_cmap("tab20").colors + plt.get_cmap("tab20b").colors[::4]))
 terminal_codes = {
     terminal: f"T{index + 1}"
     for index, terminal in enumerate(FEATURE_NAMES)

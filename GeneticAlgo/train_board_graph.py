@@ -13,7 +13,7 @@ import random
 import signal
 import subprocess
 import sys
-from collections import deque
+from collections import Counter, deque
 from concurrent.futures import ProcessPoolExecutor
 from contextlib import nullcontext
 from dataclasses import asdict, dataclass
@@ -37,6 +37,9 @@ except ImportError:
 try:
     from PacmanGame import (
         ACTIONS,
+        BASE_MOVE_FEATURE_NAMES,
+        EVASION_FEATURE_NAMES,
+        OPTIONAL_FEATURE_NAMES,
         MOVE_FEATURE_NAMES,
         Board,
         PacmanGame,
@@ -53,7 +56,15 @@ except ImportError as exc:
 PROJECT_DIR = Path(__file__).resolve().parent.parent
 VALIDATION_BOARD_PATH = PROJECT_DIR / "PacmanGame" / "test_board.txt"
 GENERATION_SEED_STRIDE = 1_000_003
-FEATURE_NAMES = MOVE_FEATURE_NAMES
+# Default training terminals: the original 19 features. The evasion features
+# (EVASION_FEATURE_NAMES) join them only with --add-features.
+FEATURE_NAMES = BASE_MOVE_FEATURE_NAMES
+# Context entered around each batch of evaluations; the C++ backend uses it to
+# convert each tree once per batch instead of once per board.
+EVALUATION_SCOPE: Callable = nullcontext
+# Replaces the "Evaluation workers" start-up line when another engine plays the
+# games (FastCore/backend.py sets it).
+EVALUATION_NOTE: str | None = None
 DEATH_PENALTY = 10_000.0
 NON_SCORING_MOVE_PENALTY = 100.0
 REVISIT_PENALTY = 50.0
@@ -312,6 +323,30 @@ _ensure_deap_types()
 Individual = creator.BoardGraphIndividual
 
 
+def _tree_height(tree) -> int:
+    """``PrimitiveTree.height`` (depth of the deepest node, root 0), the same
+    algorithm without the per-node ``max()`` call; about twice as fast.
+    Height is checked for every child (DEAP's ``staticLimit``) and every tree
+    in the statistics, so it is one of the larger Python costs per generation."""
+    stack = [0]
+    pop = stack.pop
+    extend = stack.extend
+    deepest = 0
+    for node in tree:
+        depth = pop()
+        if depth > deepest:
+            deepest = depth
+        arity = node.arity
+        if arity:
+            extend((depth + 1,) * arity)
+    return deepest
+
+
+# Set on DEAP's PrimitiveTree itself: unpickled trees belong to a class DEAP
+# recreates on load, not to Individual. Same values, so other code is unaffected.
+gp.PrimitiveTree.height = property(_tree_height)
+
+
 @dataclass(frozen=True)
 class GenerationStats:
     generation: int
@@ -388,6 +423,34 @@ def mutate_within_depth(
     return (individual,)
 
 
+def initial_expression(
+    pset: gp.PrimitiveSet,
+    min_: int,
+    max_: int,
+    full_min: int | None = None,
+    terminal_probability: float | None = None,
+) -> list:
+    """Ramped half-and-half with two adjustable parts (heights, not depths).
+
+    Half the trees are "full", with a height drawn evenly from ``full_min``
+    (default ``min_``) to ``max_``. The other half "grow": height drawn from
+    ``min_`` to ``max_``, and below ``min_`` each node becomes a terminal with
+    ``terminal_probability`` (default: the terminals' share of the primitive
+    set, which is DEAP's rule and about 0.71 here).
+    """
+    if random.random() < 0.5:
+        return gp.genFull(pset, min_ if full_min is None else full_min, max_)
+    if terminal_probability is None:
+        return gp.genGrow(pset, min_, max_)
+
+    def stop(height: int, depth: int) -> bool:
+        return depth == height or (
+            depth >= min_ and random.random() < terminal_probability
+        )
+
+    return gp.generate(pset, min_, max_, stop)
+
+
 def build_toolbox(
     primitive_set: gp.PrimitiveSet,
     min_depth: int,
@@ -397,16 +460,30 @@ def build_toolbox(
     top_probability: float,
     repair: bool = False,
     mutation_min_depth: int = MUTATION_MIN_DEPTH,
+    full_min_depth: int | None = None,
+    grow_terminal_probability: float | None = None,
 ) -> base.Toolbox:
     """Build operators for a single move-scoring PrimitiveTree."""
     toolbox = base.Toolbox()
-    toolbox.register(
-        "expression",
-        gp.genHalfAndHalf,
-        pset=primitive_set,
-        min_=min_depth - 1,
-        max_=max_depth - 1,
-    )
+    if full_min_depth is None and grow_terminal_probability is None:
+        # DEAP's own generator, so existing seeds give the same population.
+        toolbox.register(
+            "expression",
+            gp.genHalfAndHalf,
+            pset=primitive_set,
+            min_=min_depth - 1,
+            max_=max_depth - 1,
+        )
+    else:
+        toolbox.register(
+            "expression",
+            initial_expression,
+            primitive_set,
+            min_depth - 1,
+            max_depth - 1,
+            None if full_min_depth is None else full_min_depth - 1,
+            grow_terminal_probability,
+        )
     toolbox.register("individual", tools.initIterate, Individual, toolbox.expression)
     toolbox.register("population", tools.initRepeat, list, toolbox.individual)
     toolbox.register(
@@ -444,8 +521,10 @@ def build_toolbox(
     return toolbox
 
 
-def build_primitive_set(feature_names=FEATURE_NAMES) -> gp.PrimitiveSet:
-    """The one primitive set used by training, watching, and tests."""
+def build_primitive_set(feature_names=MOVE_FEATURE_NAMES) -> gp.PrimitiveSet:
+    """Primitive set over ``feature_names``; the default (every feature) can
+    run any saved tree. Training builds its own from FEATURE_NAMES and
+    --add-features / --exclude-features."""
     return build_move_primitive_set(feature_names)
 
 
@@ -467,6 +546,17 @@ def _compile_tree(expression: str, primitive_set: gp.PrimitiveSet) -> Callable:
     return _compile_expression(expression, arguments)
 
 
+def compile_policy(individual: Individual, primitive_set: gp.PrimitiveSet) -> Callable | None:
+    """The tree as a callable, or None if it cannot be compiled."""
+    try:
+        return _compile_tree(str(individual), primitive_set)
+    except (ArithmeticError, OverflowError, TypeError, ValueError):
+        return None
+
+
+_COMPILE = object()
+
+
 def choose_move(
     individual: Individual,
     observations: dict[str, dict[str, float]],
@@ -475,14 +565,18 @@ def choose_move(
     rng: random.Random,
     *,
     random_tie_break: bool = False,
+    policy: Callable | None | object = _COMPILE,
 ) -> tuple[str | None, dict[str, float]]:
-    """Score every legal candidate with the same tree."""
+    """Score every legal candidate with the same tree.
+
+    ``policy`` is the tree compiled with ``compile_policy``; pass it when
+    calling this every step, since compiling means writing the tree out as
+    text, which costs more than the move itself.
+    """
     if not observations:
         return None, {}
-    try:
-        policy = _compile_tree(str(individual), primitive_set)
-    except (ArithmeticError, OverflowError, TypeError, ValueError):
-        policy = None
+    if policy is _COMPILE:
+        policy = compile_policy(individual, primitive_set)
     scores = {}
     for action, features in observations.items():
         arguments = [features.get(name, 0.0) for name in primitive_set.arguments]
@@ -575,6 +669,7 @@ def evaluate_population_lockstep(
     stagnation_costs = [0.0] * len(games)
     stagnated = [False] * len(games)
     rngs = [random.Random(seed + index_offset + index) for index in range(len(games))]
+    policies = [compile_policy(individual, primitive_set) for individual in population]
     active = list(range(len(games)))
 
     for _ in range(timestep_limit):
@@ -588,6 +683,7 @@ def evaluate_population_lockstep(
                 game.player_direction,
                 rngs[index],
                 random_tie_break=random_tie_break,
+                policy=policies[index],
             )
             score_before = game.board.score
             game.step(move or "stay")
@@ -721,6 +817,25 @@ def evaluate_population_on_boards(
     rules: EvaluationRules = DEFAULT_RULES,
 ) -> tuple[list[float], OutcomeCounts, list[float], list[tuple[str, ...]]]:
     """Evaluate every candidate on the same boards and average its fitness."""
+    with EVALUATION_SCOPE():
+        return _evaluate_population_on_boards(
+            population, boards, timestep_limit, primitive_set,
+            parsimony=parsimony, stagnation_penalty=stagnation_penalty,
+            stagnation_grace_steps=stagnation_grace_steps,
+            stagnation_termination_steps=stagnation_termination_steps,
+            random_tie_break=random_tie_break, revisit_penalty=revisit_penalty,
+            clear_bonus=clear_bonus, death_penalty=death_penalty,
+            death_pellet_penalty=death_pellet_penalty, size_penalty=size_penalty,
+            executor=executor, workers=workers, rules=rules,
+        )
+
+
+def _evaluate_population_on_boards(
+    population, boards, timestep_limit, primitive_set, *, parsimony,
+    stagnation_penalty, stagnation_grace_steps, stagnation_termination_steps,
+    random_tie_break, revisit_penalty, clear_bonus, death_penalty,
+    death_pellet_penalty, size_penalty, executor, workers, rules,
+):
     fitness_totals = [0.0] * len(population)
     pellet_totals = [0.0] * len(population)
     labels: list[list[str]] = [[] for _ in population]
@@ -786,6 +901,96 @@ def evaluate_population_on_boards(
     )
 
 
+class BoardScores(dict):
+    """A tree's cached per-board results. Never changed in place (a new one
+    is made whenever results are added or dropped), so copies of a tree may
+    share it: deepcopy returns the same object. Copying a tree is otherwise
+    dominated by copying these, once per parent copy in every crossover."""
+
+    def __deepcopy__(self, memo):
+        return self
+
+
+def evaluate_population_with_board_cache(
+    population: Sequence[Individual],
+    boards: Sequence[tuple[int, Board]],
+    timestep_limit: int,
+    primitive_set: gp.PrimitiveSet,
+    *,
+    parsimony: float,
+    running_sum: bool = False,
+    **settings,
+) -> tuple[list[float], OutcomeCounts, list[float], list[tuple[str, ...]]]:
+    """``evaluate_population_on_boards`` that never replays a game.
+
+    Each tree remembers its result on every board in ``boards`` (in its
+    ``board_scores``, keyed by layout seed) and plays only the boards it has
+    not seen. With a rolling window of boards, the population therefore plays
+    one new game per generation while a new child plays the whole window, and
+    everyone's fitness is the mean over the same boards. Results for boards
+    that have left the window are forgotten. Takes the same settings as
+    ``evaluate_population_on_boards``; relies on games being deterministic, so
+    it must not be combined with random tie-breaking.
+
+    ``running_sum`` averages exactly as ``evaluate_population_on_boards``
+    does (adding board by board), so the cellular method gets bit-identical
+    fitness with or without the cache. Steady state keeps ``sum()``, which
+    on Python 3.12 rounds differently in the last digit, so its earlier runs
+    stay reproducible.
+    """
+    with EVALUATION_SCOPE():
+        _fill_board_cache(population, boards, timestep_limit, primitive_set,
+                          parsimony=parsimony, **settings)
+    window = [layout_seed for layout_seed, _ in boards]
+    return _cached_averages(population, window, parsimony, running_sum)
+
+
+def _fill_board_cache(population, boards, timestep_limit, primitive_set, *, parsimony, **settings):
+    for entry in boards:
+        layout_seed = entry[0]
+        unseen = [
+            tree for tree in population
+            if layout_seed not in getattr(tree, "board_scores", {})
+        ]
+        if not unseen:
+            continue
+        fitnesses, _, pellet_ratios, labels = evaluate_population_on_boards(
+            unseen, [entry], timestep_limit, primitive_set,
+            parsimony=parsimony, **settings,
+        )
+        for tree, fitness, pellet_ratio, label in zip(
+            unseen, fitnesses, pellet_ratios, labels
+        ):
+            tree.board_scores = BoardScores({
+                **getattr(tree, "board_scores", {}),
+                layout_seed: (fitness, pellet_ratio, label[0]),
+            })
+
+
+def _cached_averages(population, window, parsimony, running_sum):
+    average_fitnesses, average_pellet_ratios, all_labels = [], [], []
+    for tree in population:
+        tree.board_scores = BoardScores(
+            (seed, tree.board_scores[seed]) for seed in window
+        )
+        results = list(tree.board_scores.values())
+        if running_sum:
+            fitness_total = pellet_total = 0.0
+            for result in results:
+                fitness_total += result[0]
+                pellet_total += result[1]
+            fitness = fitness_total / len(results)
+            pellet_ratio = pellet_total / len(results)
+        else:
+            fitness = sum(result[0] for result in results) / len(results)
+            pellet_ratio = sum(result[1] for result in results) / len(results)
+        tree.fitness.values = (fitness, -parsimony * len(tree))
+        average_fitnesses.append(fitness)
+        average_pellet_ratios.append(pellet_ratio)
+        all_labels.append(tuple(result[2] for result in results))
+    return average_fitnesses, count_outcomes(all_labels), average_pellet_ratios, all_labels
+
+
 def population_statistics(
     population: Sequence[Individual],
     generation: int,
@@ -833,13 +1038,49 @@ def population_statistics(
     )
 
 
+# Rows of each history file this process has written, so later calls only
+# append the new rows instead of rewriting a file that grows every generation.
+_HISTORY_WRITTEN: dict[Path, tuple[int, int]] = {}
+
+
+def outcome_shares(stats: GenerationStats) -> str:
+    """Cleared/died/stagnated/timed-out as shares of the generation's games
+    (0 to 1), so runs with different numbers of games or boards compare
+    directly. history.csv keeps the raw counts."""
+    counts = (stats.cleared, stats.died, stats.stagnated, stats.timed_out)
+    games = sum(counts) or 1
+    return "/".join(f"{count / games:.3f}" for count in counts)
+
+
 def write_history(path: Path, history: Sequence[GenerationStats]) -> None:
+    """Write history.csv; appends when only new rows were added since this
+    process last wrote it (the file comes out the same as a full rewrite)."""
     path.parent.mkdir(parents=True, exist_ok=True)
     fields = list(GenerationStats.__dataclass_fields__)
+    written = _HISTORY_WRITTEN.get(path)
+    if (
+        written is not None
+        and written[0] <= len(history)
+        and path.exists()
+        and path.stat().st_size == written[1]
+    ):
+        with path.open("a", newline="", encoding="utf-8") as handle:
+            csv.DictWriter(handle, fieldnames=fields).writerows(
+                asdict(row) for row in history[written[0]:]
+            )
+    else:
+        with path.open("w", newline="", encoding="utf-8") as handle:
+            writer = csv.DictWriter(handle, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(asdict(row) for row in history)
+    _HISTORY_WRITTEN[path] = (len(history), path.stat().st_size)
+
+
+def write_diversity(path: Path, rows: Sequence[dict]) -> None:
     with path.open("w", newline="", encoding="utf-8") as handle:
-        writer = csv.DictWriter(handle, fieldnames=fields)
+        writer = csv.DictWriter(handle, fieldnames=list(rows[0]))
         writer.writeheader()
-        writer.writerows(asdict(row) for row in history)
+        writer.writerows(rows)
 
 
 def save_individual(individual: Individual, path: Path) -> None:
@@ -864,6 +1105,8 @@ CHECKPOINT_OPTIONAL_SETTINGS = {
     "endgame_boards": 0,
     "endgame_start": ENDGAME_START,
     "endgame_styles": "sweep",
+    "steady_duel_boards": 1,
+    "add_features": "",
 }
 
 
@@ -986,6 +1229,182 @@ def cellular_offspring(
     return offspring
 
 
+# --- Population diversity ---------------------------------------------------
+# Measured on what trees do, not on how they are written: every tree is asked
+# for its move in the same fixed sample of game situations.
+DIVERSITY_STATES = 300
+DIVERSITY_BOARDS = 6
+DIVERSITY_BOARD_SEED = 2_400_000_000  # clear of training and playoff boards
+DIVERSITY_STEPS_PER_BOARD = 250
+
+
+@lru_cache(maxsize=1)
+def diversity_states() -> tuple[tuple[dict[str, dict[str, float]], str], ...]:
+    """A fixed sample of (move observations, current direction) situations.
+
+    The same for every run, so diversity numbers are comparable between runs.
+    A wandering Pac-Man that usually takes an adjacent pellet plays a few
+    random boards; situations with a real choice (two or more legal moves) are
+    recorded. Uses its own random generator and leaves the global one alone.
+    """
+    global_state = random.getstate()
+    try:
+        rng = random.Random(DIVERSITY_BOARD_SEED)
+        states = []
+        for index in range(DIVERSITY_BOARDS):
+            game = PacmanGame(generate_board(DIVERSITY_BOARD_SEED + index))
+            for _ in range(DIVERSITY_STEPS_PER_BOARD):
+                if game.game_over or game.won:
+                    break
+                observations = game.get_move_observations()
+                if not observations:
+                    game.step("stay")
+                    continue
+                if len(observations) >= 2:
+                    states.append((
+                        {move: dict(features) for move, features in observations.items()},
+                        game.player_direction,
+                    ))
+                moves = sorted(observations)
+                with_pellet = [
+                    move for move in moves if observations[move].get("pellet_here", 0) > 0
+                ]
+                game.step(rng.choice(with_pellet if with_pellet and rng.random() < 0.8 else moves))
+        return tuple(rng.sample(states, min(DIVERSITY_STATES, len(states))))
+    finally:
+        random.setstate(global_state)
+
+
+def move_signature(tree: Individual, primitive_set: gp.PrimitiveSet) -> tuple[str, ...]:
+    """The move ``tree`` picks in each sampled situation (remembered on it)."""
+    signature = getattr(tree, "move_signature", None)
+    if signature is None:
+        rng = random.Random(0)  # unused: ties are not broken at random
+        policy = compile_policy(tree, primitive_set)
+        signature = tuple(
+            choose_move(tree, observations, primitive_set, direction, rng, policy=policy)[0]
+            for observations, direction in diversity_states()
+        )
+        tree.move_signature = signature
+    return signature
+
+
+def population_diversity(
+    population: Sequence[Individual], primitive_set: gp.PrimitiveSet
+) -> tuple[float, int]:
+    """(move diversity, distinct behaviours) for a population.
+
+    Move diversity is the chance that two different trees picked at random
+    choose different moves in a sampled situation: 0 when every tree plays
+    alike. Distinct behaviours counts the trees that differ from every other
+    in at least one sampled situation, counting each group of identical
+    players once.
+    """
+    signatures = [move_signature(tree, primitive_set) for tree in population]
+    size = len(signatures)
+    if size < 2:
+        return 0.0, len(set(signatures))
+    pairs = size * (size - 1)
+    agreeing = sum(
+        sum(count * (count - 1) for count in Counter(moves).values())
+        for moves in zip(*signatures)
+    )
+    return 1.0 - agreeing / (pairs * len(signatures[0])), len(set(signatures))
+
+
+def steady_state_children(
+    population: Sequence[Individual],
+    toolbox: base.Toolbox,
+    count: int,
+    crossover_probability: float,
+    tournament_size: int,
+) -> list[Individual]:
+    """Breed ``count`` children, each from two tournament-selected parents.
+
+    With ``crossover_probability`` the child is one of the two crossover
+    offspring, chosen at random; otherwise it is a mutated copy of the first
+    parent. The parents must already have a fitness.
+    """
+    children = []
+    for _ in range(count):
+        first, second = (
+            max(random.sample(list(population), min(tournament_size, len(population))),
+                key=lambda tree: tree.fitness)
+            for _ in range(2)
+        )
+        if random.random() < crossover_probability:
+            child = random.choice(
+                toolbox.mate(copy.deepcopy(first), copy.deepcopy(second))
+            )
+        else:
+            child, = toolbox.mutate(copy.deepcopy(first))
+        del child.fitness.values
+        # A copy of a parent carries the parent's remembered board results.
+        child.board_scores = {}
+        child.move_signature = None
+        children.append(child)
+    return children
+
+
+def steady_state_replace(
+    population: list[Individual],
+    children: Sequence[Individual],
+    worst_fraction: float,
+    pool_size: int,
+    duel_score: Callable[[Individual], float] | None = None,
+    behaviour: Callable[[Individual], object] | None = None,
+    replace_on_tie: bool = False,
+) -> list[tuple[int, int]]:
+    """Insert each child that beats a randomly drawn weak tree; edit in place.
+
+    For every child in turn: draw ``pool_size`` trees at random from the worst
+    ``worst_fraction`` of the population, take the worst of those, and replace
+    it if the child is strictly fitter. Everything must have been scored on
+    the same boards. Returns (population index, child index) per replacement.
+
+    The bottom of the population is always ranked by fitness. ``duel_score``,
+    if given, replaces fitness for the contest itself: which of the drawn
+    trees is worst, and whether the child beats it. It is called only for the
+    child and the drawn trees, so it can afford extra games.
+
+    ``behaviour``, if given, returns a key that is equal for trees that played
+    identically. A child whose key matches a tree already in the population is
+    dropped without a contest, so copies of one strategy cannot multiply.
+
+    ``replace_on_tie`` lets a child that exactly equals its opponent's score
+    (the first fitness value, which includes the size cost) take its place, so
+    a different genome that plays as well can drift into the population.
+    Otherwise the child must be strictly better, and on equal scores the
+    smaller tree wins through the parsimony tie-break.
+    """
+    score = duel_score or (lambda tree: tree.fitness)
+    present = (
+        Counter(behaviour(tree) for tree in population) if behaviour else None
+    )
+    replaced = []
+    worst_count = max(1, min(len(population), round(len(population) * worst_fraction)))
+    for child_index, child in enumerate(children):
+        if present is not None and present[behaviour(child)] > 0:
+            continue
+        weakest = sorted(range(len(population)), key=lambda index: population[index].fitness)
+        pool = random.sample(weakest[:worst_count], min(pool_size, worst_count))
+        victim = min(pool, key=lambda index: score(population[index]))
+        if replace_on_tie:
+            child_score, victim_score = score(child), score(population[victim])
+            if duel_score is None:
+                child_score, victim_score = child_score.values[0], victim_score.values[0]
+            wins = child_score >= victim_score
+        else:
+            wins = score(child) > score(population[victim])
+        if wins:
+            if present is not None:
+                present[behaviour(population[victim])] -= 1
+                present[behaviour(child)] += 1
+            population[victim] = child
+            replaced.append((victim, child_index))
+    return replaced
+
+
 def evolve(
     primitive_set: gp.PrimitiveSet,
     args: argparse.Namespace,
@@ -1003,6 +1422,8 @@ def evolve(
         args.top_probability,
         repair=args.repair,
         mutation_min_depth=args.mutation_min_depth,
+        full_min_depth=args.full_min_initial_depth,
+        grow_terminal_probability=args.grow_terminal_probability,
     )
     population = toolbox.population(n=args.population_size)
     if args.repair:
@@ -1094,7 +1515,7 @@ def evolve(
         else (os.cpu_count() or 1)
     )
     worker_count = min(args.population_size, args.workers or available_cpus)
-    print(f"Evaluation workers: {worker_count}")
+    print(EVALUATION_NOTE or f"Evaluation workers: {worker_count}")
     worker_pool = (
         ProcessPoolExecutor(max_workers=worker_count)
         if worker_count > 1
@@ -1104,6 +1525,32 @@ def evolve(
     boards_replaced = (
         args.boards_replaced_per_generation or args.boards_per_generation
     )
+    # Steady state scores every tree on one game only: no champion tournament
+    # and no validation game.
+    raw_champion = args.evolution_method == "steady"
+    # Steady state keeps each tree's result per board, so with a rolling window
+    # of boards only unseen games are played.
+    # Cellular survivors keep their results too (--no-board-cache turns this
+    # off): a parent replays only the boards that rotated in, a child plays
+    # all of them. Same results as replaying, since games are deterministic.
+    cellular_cache = (
+        args.evolution_method == "cellular"
+        and args.board_cache
+        and not args.random_tie_break
+    )
+    if raw_champion:
+        evaluate_training = evaluate_population_with_board_cache
+    elif cellular_cache:
+        def evaluate_training(*arguments, **settings):
+            return evaluate_population_with_board_cache(
+                *arguments, running_sum=True, **settings
+            )
+    else:
+        evaluate_training = evaluate_population_on_boards
+    steady_replacements = (
+        checkpoint.get("steady_replacements", 0) if checkpoint is not None else 0
+    )
+    diversity_rows = list(checkpoint.get("diversity", [])) if checkpoint is not None else []
     with worker_pool as executor:
         for generation in range(start_generation, args.generations):
             # Rotate the training boards: after generation 0 only the oldest
@@ -1141,13 +1588,21 @@ def evolve(
             )[-args.boards_per_generation:]
             endgame_flags = (endgame_flags + new_flags)[-args.boards_per_generation:]
             layout_seed = boards[0][0]
-            for board_index, (_, board) in enumerate(boards):
+            # --save-interval N keeps the per-generation files (layouts and
+            # the generation's best tree) for every N-th generation only.
+            keep_files = (generation + 1) % args.save_interval == 0
+            # Steady state adds one board per generation; saving the newest is
+            # enough to rebuild any window.
+            saved_boards = boards[-1:] if raw_champion else boards
+            for board_index, (_, board) in enumerate(saved_boards if keep_files else ()):
                 suffix = "" if board_index == 0 else f"_board_{board_index:04d}"
                 layout_path = (
                     output_directory / "layouts" / f"generation_{generation:04d}{suffix}.txt"
                 )
                 write_board(board, layout_path)
-            fitnesses, outcomes, _, parent_outcome_labels = evaluate_population_on_boards(
+            (
+                fitnesses, outcomes, parent_pellet_ratios, parent_outcome_labels
+            ) = evaluate_training(
                 population,
                 boards,
                 args.timestep_limit,
@@ -1177,12 +1632,16 @@ def evolve(
                     args.mutation_probability,
                     args.cellular_tournament_size,
                 )
+                for child in children:
+                    # Copies of a parent carry its results; a child plays
+                    # every board itself.
+                    child.board_scores = {}
                 (
                     _,
                     _,
                     _,
                     child_outcome_labels,
-                ) = evaluate_population_on_boards(
+                ) = evaluate_training(
                     children,
                     boards,
                     args.timestep_limit,
@@ -1213,77 +1672,207 @@ def evolve(
                 population = selected_population
                 outcomes = count_outcomes(selected_outcomes)
 
-            # Pick the generation champion on the fixed tournament boards, not
-            # on this generation's few training boards.
-            candidates = champion_candidates(population, args.champion_candidates)
-            (
-                tournament_fitnesses,
-                _,
-                tournament_pellet_ratios,
-                _,
-            ) = evaluate_population_on_boards(
-                candidates,
-                tournament_boards,
-                args.timestep_limit,
-                primitive_set,
-                parsimony=args.parsimony,
-                stagnation_penalty=args.stagnation_penalty,
-                stagnation_grace_steps=args.stagnation_grace_steps,
-                stagnation_termination_steps=args.stagnation_termination_steps,
-                revisit_penalty=args.revisit_penalty,
-                clear_bonus=args.clear_bonus,
-                death_penalty=args.death_penalty,
-                death_pellet_penalty=args.death_pellet_penalty,
-                size_penalty=args.size_penalty,
-                random_tie_break=args.random_tie_break,
-                executor=executor,
-                workers=worker_count,
-                rules=rules,
-            )
-            champion_index = max(
-                range(len(candidates)), key=lambda index: candidates[index].fitness
-            )
-            generation_best = candidates[champion_index]
-            tournament_fitness = tournament_fitnesses[champion_index]
-            tournament_pellet_ratio = tournament_pellet_ratios[champion_index]
-            tournament_rank = generation_best.fitness.wvalues
-            is_tournament_best = tournament_rank > best_tournament_rank
-            if is_tournament_best:
-                best_tournament_rank = tournament_rank
-                best_tournament_fitness = tournament_fitness
-            # Validate a copy so the champion keeps its tournament fitness.
-            validation_candidate = copy.deepcopy(generation_best)
-            (
-                validation_fitnesses,
-                validation_outcomes,
-                validation_pellet_ratios,
-                _,
-            ) = evaluate_population_lockstep(
-                [validation_candidate],
-                validation_board,
-                args.timestep_limit,
-                primitive_set,
-                parsimony=args.parsimony,
-                stagnation_penalty=args.stagnation_penalty,
-                stagnation_grace_steps=args.stagnation_grace_steps,
-                stagnation_termination_steps=args.stagnation_termination_steps,
-                revisit_penalty=args.revisit_penalty,
-                clear_bonus=args.clear_bonus,
-                death_penalty=args.death_penalty,
-                death_pellet_penalty=args.death_pellet_penalty,
-                size_penalty=args.size_penalty,
-                seed=args.seed,
-                random_tie_break=args.random_tie_break,
-                rules=rules,
-            )
-            validation_fitness = validation_fitnesses[0]
-            validation_pellet_ratio = validation_pellet_ratios[0]
-            validation_rank = validation_candidate.fitness.wvalues
-            is_overall_best = validation_rank > best_validation_rank
-            if is_overall_best:
-                best_validation_rank = validation_rank
-                best_validation_fitness = validation_fitness
-                best_validation_pellet_ratio = validation_pellet_ratio
+            elif args.evolution_method == "steady":
+                # Steady state: a few children per board, each of which must
+                # beat a weak tree drawn from the bottom of the population.
+                children = steady_state_children(
+                    population,
+                    toolbox,
+                    args.steady_children,
+                    args.crossover_probability,
+                    args.steady_tournament_size,
+                )
+                (
+                    _,
+                    _,
+                    child_pellet_ratios,
+                    child_outcome_labels,
+                ) = evaluate_training(
+                    children,
+                    boards,
+                    args.timestep_limit,
+                    primitive_set,
+                    parsimony=args.parsimony,
+                    stagnation_penalty=args.stagnation_penalty,
+                    stagnation_grace_steps=args.stagnation_grace_steps,
+                    stagnation_termination_steps=args.stagnation_termination_steps,
+                    revisit_penalty=args.revisit_penalty,
+                    clear_bonus=args.clear_bonus,
+                    death_penalty=args.death_penalty,
+                    death_pellet_penalty=args.death_pellet_penalty,
+                    size_penalty=args.size_penalty,
+                    random_tie_break=args.random_tie_break,
+                    executor=executor,
+                    workers=worker_count,
+                    rules=rules,
+                )
+                selected_outcomes = list(parent_outcome_labels)
+                selected_pellets = list(parent_pellet_ratios)
+                duel_score = None
+                if args.steady_duel_boards > len(boards):
+                    # The contest between a child and its three opponents is
+                    # decided on more games than everyone else plays: this
+                    # generation's boards plus extra ones only those trees see.
+                    duel_boards = [
+                        generation_board(
+                            args.seed, generation, args.boards_per_generation + extra
+                        )
+                        for extra in range(args.steady_duel_boards - len(boards))
+                    ]
+                    duel_scores: dict[int, tuple[Individual, float]] = {}
+
+                    def duel_score(tree: Individual) -> float:
+                        # Keyed by identity; the tree is kept so the key
+                        # cannot be reused while this generation lasts.
+                        if id(tree) not in duel_scores:
+                            extra_fitness, _, _, _ = evaluate_population_on_boards(
+                                [copy.deepcopy(tree)],
+                                duel_boards,
+                                args.timestep_limit,
+                                primitive_set,
+                                parsimony=args.parsimony,
+                                stagnation_penalty=args.stagnation_penalty,
+                                stagnation_grace_steps=args.stagnation_grace_steps,
+                                stagnation_termination_steps=args.stagnation_termination_steps,
+                                revisit_penalty=args.revisit_penalty,
+                                clear_bonus=args.clear_bonus,
+                                death_penalty=args.death_penalty,
+                                death_pellet_penalty=args.death_pellet_penalty,
+                                size_penalty=args.size_penalty,
+                                random_tie_break=args.random_tie_break,
+                                rules=rules,
+                            )
+                            total = (
+                                tree.fitness.values[0] * len(boards)
+                                + extra_fitness[0] * len(duel_boards)
+                            )
+                            duel_scores[id(tree)] = (
+                                tree, total / (len(boards) + len(duel_boards))
+                            )
+                        return duel_scores[id(tree)][1]
+
+                replacements = steady_state_replace(
+                    population,
+                    children,
+                    args.steady_worst_fraction,
+                    args.steady_replacement_pool,
+                    duel_score,
+                    # Fitness with the size cost put back is the game result
+                    # alone: equal on every board means the same play.
+                    (
+                        (lambda tree: round(
+                            tree.fitness.values[0]
+                            + size_cost(len(tree), args.size_penalty), 6
+                        ))
+                        if args.steady_reject_duplicates
+                        else None
+                    ),
+                    args.steady_replace_on_tie,
+                )
+                for population_index, child_index in replacements:
+                    selected_outcomes[population_index] = child_outcome_labels[child_index]
+                    selected_pellets[population_index] = child_pellet_ratios[child_index]
+                outcomes = count_outcomes(selected_outcomes)
+                steady_replacements += len(replacements)
+                move_diversity, behaviours = population_diversity(population, primitive_set)
+                diversity_rows.append({
+                    "generation": generation,
+                    "move_diversity": round(move_diversity, 4),
+                    "distinct_behaviours": behaviours,
+                    "distinct_expressions": len({str(tree) for tree in population}),
+                })
+                write_diversity(output_directory / "diversity.csv", diversity_rows)
+
+            if raw_champion:
+                # Steady state: one game per tree and nothing else. The
+                # generation's best is simply the highest raw fitness on this
+                # generation's board, and the "tournament" and "validation"
+                # columns repeat that one game.
+                best_index = max(
+                    range(len(population)), key=lambda index: population[index].fitness
+                )
+                generation_best = copy.deepcopy(population[best_index])
+                tournament_fitness = validation_fitness = generation_best.fitness.values[0]
+                tournament_pellet_ratio = validation_pellet_ratio = selected_pellets[best_index]
+                validation_outcomes = count_outcomes([selected_outcomes[best_index]])
+                tournament_rank = generation_best.fitness.wvalues
+                is_tournament_best = tournament_rank > best_tournament_rank
+                if is_tournament_best:
+                    best_tournament_rank = best_validation_rank = tournament_rank
+                    best_tournament_fitness = best_validation_fitness = tournament_fitness
+                    best_validation_pellet_ratio = tournament_pellet_ratio
+            else:
+                # Pick the generation champion on the fixed tournament boards, not
+                # on this generation's few training boards.
+                candidates = champion_candidates(population, args.champion_candidates)
+                (
+                    tournament_fitnesses,
+                    _,
+                    tournament_pellet_ratios,
+                    _,
+                ) = evaluate_population_on_boards(
+                    candidates,
+                    tournament_boards,
+                    args.timestep_limit,
+                    primitive_set,
+                    parsimony=args.parsimony,
+                    stagnation_penalty=args.stagnation_penalty,
+                    stagnation_grace_steps=args.stagnation_grace_steps,
+                    stagnation_termination_steps=args.stagnation_termination_steps,
+                    revisit_penalty=args.revisit_penalty,
+                    clear_bonus=args.clear_bonus,
+                    death_penalty=args.death_penalty,
+                    death_pellet_penalty=args.death_pellet_penalty,
+                    size_penalty=args.size_penalty,
+                    random_tie_break=args.random_tie_break,
+                    executor=executor,
+                    workers=worker_count,
+                    rules=rules,
+                )
+                champion_index = max(
+                    range(len(candidates)), key=lambda index: candidates[index].fitness
+                )
+                generation_best = candidates[champion_index]
+                tournament_fitness = tournament_fitnesses[champion_index]
+                tournament_pellet_ratio = tournament_pellet_ratios[champion_index]
+                tournament_rank = generation_best.fitness.wvalues
+                is_tournament_best = tournament_rank > best_tournament_rank
+                if is_tournament_best:
+                    best_tournament_rank = tournament_rank
+                    best_tournament_fitness = tournament_fitness
+                # Validate a copy so the champion keeps its tournament fitness.
+                validation_candidate = copy.deepcopy(generation_best)
+                (
+                    validation_fitnesses,
+                    validation_outcomes,
+                    validation_pellet_ratios,
+                    _,
+                ) = evaluate_population_lockstep(
+                    [validation_candidate],
+                    validation_board,
+                    args.timestep_limit,
+                    primitive_set,
+                    parsimony=args.parsimony,
+                    stagnation_penalty=args.stagnation_penalty,
+                    stagnation_grace_steps=args.stagnation_grace_steps,
+                    stagnation_termination_steps=args.stagnation_termination_steps,
+                    revisit_penalty=args.revisit_penalty,
+                    clear_bonus=args.clear_bonus,
+                    death_penalty=args.death_penalty,
+                    death_pellet_penalty=args.death_pellet_penalty,
+                    size_penalty=args.size_penalty,
+                    seed=args.seed,
+                    random_tie_break=args.random_tie_break,
+                    rules=rules,
+                )
+                validation_fitness = validation_fitnesses[0]
+                validation_pellet_ratio = validation_pellet_ratios[0]
+                validation_rank = validation_candidate.fitness.wvalues
+                is_overall_best = validation_rank > best_validation_rank
+                if is_overall_best:
+                    best_validation_rank = validation_rank
+                    best_validation_fitness = validation_fitness
+                    best_validation_pellet_ratio = validation_pellet_ratio
             stats = population_statistics(
                 population,
                 generation,
@@ -1302,24 +1891,36 @@ def evolve(
             if is_tournament_best:
                 hall_of_fame.clear()
                 hall_of_fame.update([generation_best])
-            save_individual(
-                generation_best,
-                output_directory / f"generation_{generation:04d}_best.pkl",
-            )
+            if keep_files:
+                save_individual(
+                    generation_best,
+                    output_directory / f"generation_{generation:04d}_best.pkl",
+                )
             save_individual(hall_of_fame[0], output_directory / "best_overall.pkl")
-            print(
-                f"g={generation:04d} seed={layout_seed} "
-                f"fit={stats.best_fitness:.0f}/{stats.average_fitness:.0f} "
-                f"val={stats.validation_fitness:.0f}/"
-                f"{stats.best_validation_fitness_so_far:.0f} "
-                f"p={stats.validation_pellet_ratio:.1%}/"
-                f"{stats.best_validation_pellet_ratio_so_far:.1%} "
-                f"10-board={stats.tournament_fitness:.0f}/"
-                f"{stats.best_tournament_fitness_so_far:.0f} "
-                f"C/D/S/T={stats.cleared}/{stats.died}/{stats.stagnated}/"
-                f"{stats.timed_out} "
-                f"n={stats.average_node_count:.1f}"
-            )
+            if raw_champion:
+                print(
+                    f"g={generation:04d} seed={layout_seed} "
+                    f"fit={stats.best_fitness:.0f}/{stats.average_fitness:.0f} "
+                    f"best-ever={stats.best_tournament_fitness_so_far:.0f} "
+                    f"p={stats.tournament_pellet_ratio:.1%} "
+                    f"C/D/S/T={outcome_shares(stats)} "
+                    f"n={stats.average_node_count:.1f} "
+                    f"accepted={steady_replacements} "
+                    f"diversity={move_diversity:.1%} behaviours={behaviours}"
+                )
+            else:
+                print(
+                    f"g={generation:04d} seed={layout_seed} "
+                    f"fit={stats.best_fitness:.0f}/{stats.average_fitness:.0f} "
+                    f"val={stats.validation_fitness:.0f}/"
+                    f"{stats.best_validation_fitness_so_far:.0f} "
+                    f"p={stats.validation_pellet_ratio:.1%}/"
+                    f"{stats.best_validation_pellet_ratio_so_far:.1%} "
+                    f"10-board={stats.tournament_fitness:.0f}/"
+                    f"{stats.best_tournament_fitness_so_far:.0f} "
+                    f"C/D/S/T={outcome_shares(stats)} "
+                    f"n={stats.average_node_count:.1f}"
+                )
             stopped_early = (
                 args.target_fitness is not None
                 and stats.validation_fitness >= args.target_fitness
@@ -1361,6 +1962,8 @@ def evolve(
                     "tournament_seeds": tournament_seeds,
                     "board_seeds": [seed for seed, _ in boards],
                     "board_endgame": endgame_flags,
+                    "steady_replacements": steady_replacements,
+                    "diversity": diversity_rows,
                 },
             )
             if stopped_early:
@@ -1386,9 +1989,72 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--evolution-method",
-        choices=("global", "cellular"),
+        choices=("global", "cellular", "steady"),
         default="global",
-        help="global over-selection or cellular GP on a toroidal grid",
+        help=(
+            "global over-selection, cellular GP on a toroidal grid, or steady "
+            "state (a few children per generation replace weak trees)"
+        ),
+    )
+    parser.add_argument(
+        "--steady-children",
+        type=int,
+        default=1,
+        help=(
+            "steady state: children bred per generation, all scored on that "
+            "generation's boards (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--steady-tournament-size",
+        type=int,
+        default=3,
+        help="steady state: tournament size for choosing each parent (default: %(default)s)",
+    )
+    parser.add_argument(
+        "--steady-worst-fraction",
+        type=float,
+        default=0.20,
+        help=(
+            "steady state: the bottom share of the population a child's "
+            "opponent is drawn from (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--steady-reject-duplicates",
+        action="store_true",
+        help=(
+            "steady state: drop a child that played this generation's boards "
+            "exactly like a tree already in the population, whatever its "
+            "expression looks like (default: off)"
+        ),
+    )
+    parser.add_argument(
+        "--steady-replace-on-tie",
+        action="store_true",
+        help=(
+            "steady state: a child whose score equals its opponent's replaces "
+            "it (default: the child must be strictly better)"
+        ),
+    )
+    parser.add_argument(
+        "--steady-duel-boards",
+        type=int,
+        default=1,
+        help=(
+            "steady state: games that decide whether a child replaces its "
+            "opponent. Above --boards-per-generation, the child and the drawn "
+            "trees (and only they) play the extra boards (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--steady-replacement-pool",
+        type=int,
+        default=3,
+        help=(
+            "steady state: trees drawn at random from that bottom share; the "
+            "child replaces the worst of them if it is fitter (default: %(default)s)"
+        ),
     )
     parser.add_argument(
         "--cellular-tournament-size",
@@ -1418,6 +2084,17 @@ def parse_args() -> argparse.Namespace:
         help=(
             "distinct top training trees scored on the 10 tournament boards to "
             "choose each generation's champion (default: %(default)s)"
+        ),
+    )
+    parser.add_argument(
+        "--save-interval",
+        type=int,
+        default=1,
+        help=(
+            "write generation_NNNN_best.pkl and the layout files for every "
+            "N-th generation only (N-1, 2N-1, ...); best_overall.pkl, "
+            "history.csv and the checkpoint are still written every "
+            "generation (default: %(default)s)"
         ),
     )
     parser.add_argument("--timestep-limit", type=int, default=1000)
@@ -1505,6 +2182,23 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--min-initial-depth", type=int, default=2)
     parser.add_argument("--max-initial-depth", type=int, default=5)
+    parser.add_argument(
+        "--full-min-initial-depth",
+        type=int,
+        help=(
+            "smallest depth of the 'full' half of the starting population "
+            "(default: --min-initial-depth)"
+        ),
+    )
+    parser.add_argument(
+        "--grow-terminal-probability",
+        type=float,
+        help=(
+            "chance that a node in the 'grow' half of the starting population "
+            "is a terminal; 0.4 gives a 60/40 function/terminal split "
+            "(default: the terminals' share of the primitive set, about 0.71)"
+        ),
+    )
     parser.add_argument("--max-evolved-depth", type=int, default=10)
     parser.add_argument("--crossover-probability", type=float, default=0.97)
     parser.add_argument("--mutation-probability", type=float, default=0.03)
@@ -1548,6 +2242,24 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument(
+        "--no-board-cache",
+        dest="board_cache",
+        action="store_false",
+        help=(
+            "cellular: replay every board every generation instead of keeping "
+            "each surviving tree's results (same results, slower; for checking)"
+        ),
+    )
+    parser.add_argument(
+        "--add-features",
+        default="",
+        help=(
+            "comma-separated optional features to add to the default terminals "
+            f"({', '.join(OPTIONAL_FEATURE_NAMES)}); 'all' stands for the three "
+            "evasion features, e.g. 'all,pellets_left' (default: none)"
+        ),
+    )
+    parser.add_argument(
         "--exclude-features",
         default="",
         help=(
@@ -1585,6 +2297,24 @@ def endgame_styles(args: argparse.Namespace) -> tuple[str, ...]:
     return tuple(name.strip() for name in args.endgame_styles.split(",") if name.strip())
 
 
+def added_features(args: argparse.Namespace) -> tuple[str, ...]:
+    names = tuple(name.strip() for name in args.add_features.split(",") if name.strip())
+    expanded = []
+    for name in names:
+        expanded.extend(EVASION_FEATURE_NAMES if name == "all" else (name,))
+    return tuple(expanded)
+
+
+def training_features(args: argparse.Namespace) -> tuple[str, ...]:
+    """The run's terminals: defaults plus --add-features, minus --exclude-features."""
+    excluded = set(excluded_features(args))
+    added = added_features(args)
+    return tuple(
+        name for name in MOVE_FEATURE_NAMES
+        if (name in FEATURE_NAMES or name in added) and name not in excluded
+    )
+
+
 def excluded_features(args: argparse.Namespace) -> tuple[str, ...]:
     return tuple(name.strip() for name in args.exclude_features.split(",") if name.strip())
 
@@ -1600,7 +2330,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("death penalties must be nonnegative")
     if args.mutation_min_depth < 0:
         raise ValueError("mutation-min-depth must be nonnegative")
-    unknown = set(excluded_features(args)) - set(FEATURE_NAMES)
+    unknown_added = set(added_features(args)) - set(OPTIONAL_FEATURE_NAMES)
+    if unknown_added:
+        raise ValueError(f"unknown --add-features: {', '.join(sorted(unknown_added))}")
+    unknown = set(excluded_features(args)) - set(MOVE_FEATURE_NAMES)
     if unknown:
         raise ValueError(f"unknown feature(s) to exclude: {', '.join(sorted(unknown))}")
     if args.size_penalty < 0:
@@ -1629,12 +2362,29 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("boards-per-generation must be between 1 and 1000002")
     if args.cellular_tournament_size < 1:
         raise ValueError("cellular-tournament-size must be positive")
+    if min(
+        args.steady_children, args.steady_tournament_size,
+        args.steady_replacement_pool, args.steady_duel_boards,
+    ) < 1:
+        raise ValueError("steady-state counts must be positive")
+    if not 0 < args.steady_worst_fraction <= 1:
+        raise ValueError("steady-worst-fraction must be above 0 and at most 1")
+    if args.evolution_method == "steady" and args.random_tie_break:
+        raise ValueError("steady state remembers game results, so it cannot use random-tie-break")
+    if args.save_interval < 1:
+        raise ValueError("save-interval must be positive")
     if args.timestep_limit < 1:
         raise ValueError("timestep-limit must be positive")
     if args.video_fps <= 0:
         raise ValueError("video-fps must be positive")
     if args.min_initial_depth < 1 or args.max_initial_depth < args.min_initial_depth:
         raise ValueError("invalid initial depth range")
+    if args.full_min_initial_depth is not None and not (
+        args.min_initial_depth <= args.full_min_initial_depth <= args.max_initial_depth
+    ):
+        raise ValueError("full-min-initial-depth must lie within the initial depth range")
+    if args.grow_terminal_probability is not None and not 0 < args.grow_terminal_probability < 1:
+        raise ValueError("grow-terminal-probability must be between 0 and 1")
     if args.max_evolved_depth < args.max_initial_depth:
         raise ValueError("max evolved depth cannot be below initial depth")
     if not math.isclose(
@@ -1643,15 +2393,29 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("crossover and mutation probabilities must total 1")
 
 
+def artifact_python() -> str:
+    """Interpreter for the plots and videos written after training.
+
+    Under PyPy, which usually lacks matplotlib and Pillow, that is the normal
+    environment's Python; otherwise the one running now.
+    """
+    import platform
+
+    regular = PROJECT_DIR / "GeneticAlgo" / ".venv" / "bin" / "python"
+    if platform.python_implementation() == "PyPy" and regular.exists():
+        return str(regular)
+    return sys.executable
+
+
 def generate_artifacts(args: argparse.Namespace, output: Path) -> bool:
     history, best = output / "history.csv", output / "best_overall.pkl"
     if not history.exists() or not best.exists():
         print("No generation completed; there is no evaluated individual to render.", file=sys.stderr)
         return False
-    subprocess.run([sys.executable, str(PROJECT_DIR / "plot_board_graph.py"), str(history), str(output), str(best)], cwd=PROJECT_DIR, check=True)
+    subprocess.run([artifact_python(), str(PROJECT_DIR / "plot_board_graph.py"), str(history), str(output), str(best)], cwd=PROJECT_DIR, check=True)
     if not args.no_video:
         # The final video always plays the original arcade maze.
-        command = [sys.executable, "-m", "GeneticAlgo.watch_board_graph", str(best), "--board", str(VALIDATION_BOARD_PATH), "--video", str(output / "best_overall.mp4"), "--fps", str(args.video_fps), "--scale", str(args.video_scale), "--max-steps", str(args.timestep_limit), "--seed", str(args.seed)]
+        command = [artifact_python(), "-m", "GeneticAlgo.watch_board_graph", str(best), "--board", str(VALIDATION_BOARD_PATH), "--video", str(output / "best_overall.mp4"), "--fps", str(args.video_fps), "--scale", str(args.video_scale), "--max-steps", str(args.timestep_limit), "--seed", str(args.seed)]
         if args.random_tie_break:
             command.append("--random-tie-break")
         subprocess.run(command, cwd=PROJECT_DIR, check=True)
@@ -1668,11 +2432,16 @@ def main() -> int:
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     output = args.output_directory or Path("runs") / f"board_graph_{timestamp}"
     output.mkdir(parents=True, exist_ok=True)
-    excluded = excluded_features(args)
-    feature_names = tuple(name for name in FEATURE_NAMES if name not in excluded)
+    feature_names = training_features(args)
     primitive_set = build_primitive_set(feature_names)
     print(f"Run artifacts: {output}")
     print(f"Terminals: {', '.join(feature_names)}")
+    if args.full_min_initial_depth is not None or args.grow_terminal_probability is not None:
+        print(
+            "Starting trees: full half from depth "
+            f"{args.full_min_initial_depth or args.min_initial_depth}, grow half "
+            f"with terminal probability {args.grow_terminal_probability or 'default'}"
+        )
     print(
         f"Tree repair: {'on' if args.repair else 'off'}; "
         f"mutation inserts from depth {args.mutation_min_depth}"
@@ -1699,6 +2468,16 @@ def main() -> int:
         print(
             f"Evolution: cellular {rows}x{columns} toroidal grid, "
             f"Moore neighborhood, tournament={args.cellular_tournament_size}"
+        )
+    elif args.evolution_method == "steady":
+        print(
+            f"Evolution: steady state, {args.steady_children} child(ren) per "
+            f"generation, parent tournament={args.steady_tournament_size}; each "
+            f"child must beat the worst of {args.steady_replacement_pool} drawn "
+            f"from the bottom {args.steady_worst_fraction:.0%}, over "
+            f"{max(args.steady_duel_boards, args.boards_per_generation)} game(s)"
+            + ("; duplicates of existing play are dropped" if args.steady_reject_duplicates else "")
+            + ("; a tie goes to the child" if args.steady_replace_on_tie else "")
         )
     else:
         print("Evolution: global over-selection")

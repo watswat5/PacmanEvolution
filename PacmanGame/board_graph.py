@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from collections import deque
+from collections.abc import Mapping as MappingBase
 from functools import lru_cache
 import math
 from types import MappingProxyType
@@ -21,13 +22,21 @@ GHOST_KEYS = ("blinky_pos", "pinky_pos", "inky_pos", "clyde_pos")
 DEFAULT_POWERUP_DURATION = 52
 # Tile-path radius used by ``danger_ghosts_nearby``.
 GHOST_NEAR_RADIUS = 8
+# Tiles of each dangerous ghost's route that ghost_path_conflict predicts.
+GHOST_PREDICTION_STEPS = 10
+# Longer route prediction used by ``onward_safe_exits``.
+GHOST_FAR_PREDICTION_STEPS = 25
+# Dots left at which Blinky turns "Cruise Elroy" (pacman.ELROY_STAGES): the
+# ``elroy`` feature is 0.5 at the first stage and 1.0 at the second.
+ELROY_STAGE_DOTS = (20, 10)
 # Pac-Man steps that ``recently_visited`` remembers (also the trainer's
 # revisit-penalty window).
 VISIT_WINDOW = 12
 
 # Every value is bounded: distances are normalized to [0, 1) with exactly 1.0
 # meaning "no such target / unreachable", flags and fractions lie in [0, 1],
-# and ``pellet_center_direction`` and ``junction_ghost_margin`` lie in [-1, 1].
+# and ``pellet_center_direction``, ``junction_ghost_margin`` and
+# ``danger_ghost_approaching`` lie in [-1, 1].
 # Append new names at the end so previously pickled trees keep working.
 MOVE_FEATURE_NAMES = (
     "pellet_here",
@@ -49,7 +58,30 @@ MOVE_FEATURE_NAMES = (
     "pellet_center_direction",
     "junction_ghost_margin",
     "safe_escape_options",
+    # Evasion features (2026-10-09). Training leaves them out unless asked
+    # (train_board_graph.py --add-features); see EVASION_FEATURE_NAMES.
+    "danger_ghost_approaching",
+    "pincer",
+    "safe_territory",
+    # Game phase (2026-10-10): share of the board's pellets still uneaten.
+    "pellets_left",
+    # Endgame cues (2026-10-10): nearest pellet Pac-Man can reach before
+    # every dangerous ghost, and whether a ghost's predicted route meets the
+    # corridor this move enters.
+    "safe_pellet_distance",
+    "ghost_path_conflict",
+    # Death analysis (2026-10-11): Blinky speeds up late, power pellets as a
+    # late escape, and whether the corridors beyond this one stay clear.
+    "blinky_distance",
+    "elroy",
+    "safe_power_pellet_distance",
+    "onward_safe_exits",
 )
+# The original 19 features, the trainer's default terminals.
+BASE_MOVE_FEATURE_NAMES = MOVE_FEATURE_NAMES[:19]
+EVASION_FEATURE_NAMES = MOVE_FEATURE_NAMES[19:22]
+# Features training can add with --add-features.
+OPTIONAL_FEATURE_NAMES = MOVE_FEATURE_NAMES[19:]
 LayoutKey = tuple[tuple[bool, ...], ...]
 
 
@@ -237,6 +269,41 @@ def precompute_board_graph(board: GameBoard) -> StaticBoardGraph:
     return _precompute_layout(_layout_key(board))
 
 
+class NearestDistanceMap(MappingBase):
+    """Read-only map from each tile to its path distance to the nearest source.
+
+    Values come from the precomputed all-pairs table, worked out only for the
+    tiles that are actually looked up (usually the three or four tiles next to
+    Pac-Man), instead of a breadth-first search over the whole maze every time
+    a pellet is eaten. Same numbers as that search.
+    """
+
+    __slots__ = ("_static", "_sources", "_cache")
+
+    def __init__(self, static: StaticBoardGraph, sources: Iterable[Point]):
+        self._static = static
+        ids = static.point_ids
+        self._sources = tuple({ids[point] for point in sources if point in ids})
+        self._cache: dict[Point, int] = {}
+
+    def __getitem__(self, point: Point) -> int:
+        cached = self._cache.get(point)
+        if cached is None:
+            if not self._sources:
+                cached = self._static.unreachable_distance
+            else:
+                row = self._static.distances[self._static.point_ids[point]]
+                cached = min(map(row.__getitem__, self._sources))
+            self._cache[point] = cached
+        return cached
+
+    def __iter__(self):
+        return iter(self._static.points)
+
+    def __len__(self) -> int:
+        return len(self._static.points)
+
+
 class ObservationProvider:
     """Per-game dynamic state backed by a shared precomputed graph."""
 
@@ -300,6 +367,11 @@ class ObservationProvider:
             return 0.0
         return (VISIT_WINDOW - max(age, 1) + 1) / VISIT_WINDOW
 
+    @property
+    def collectibles_left(self) -> int:
+        """Pellets and power pellets still on the board."""
+        return len(self._collectibles)
+
     def pellet_consumed(self, point: Point, *, ordinary: bool, power: bool) -> None:
         was_collectible = point in self._collectibles
         if ordinary and point in self._pellets:
@@ -350,20 +422,8 @@ class ObservationProvider:
             self._distance_cache.pop("edible_ghost", None)
         return roles
 
-    def _distance_map(self, sources: Iterable[Point]) -> dict[Point, int]:
-        distances = {point: self.unreachable_distance for point in self.static.points}
-        queue = deque()
-        for point in sources:
-            if point in distances and distances[point] != 0:
-                distances[point] = 0
-                queue.append(point)
-        while queue:
-            point = queue.popleft()
-            for other in self.neighbors[point].values():
-                if distances[other] == self.unreachable_distance:
-                    distances[other] = distances[point] + 1
-                    queue.append(other)
-        return distances
+    def _distance_map(self, sources: Iterable[Point]) -> Mapping[Point, int]:
+        return NearestDistanceMap(self.static, sources)
 
     def _ghost_distance_map(self, positions: tuple[Point, ...]) -> dict[Point, int]:
         return {
@@ -387,7 +447,10 @@ class ObservationProvider:
                 )
             else:
                 raise ValueError(f"unknown distance-map target {target!r}")
-            self._distance_cache[target] = MappingProxyType(distances)
+            self._distance_cache[target] = (
+                distances if isinstance(distances, NearestDistanceMap)
+                else MappingProxyType(distances)
+            )
         return self._distance_cache[target]
 
     def _ghost_distances(self, candidate: Point, ghosts: tuple[Point, ...]) -> list[int]:
@@ -433,13 +496,217 @@ class ObservationProvider:
             return 1.0
         return distance / self.distance_scale
 
+    def _approaching(
+        self, ghost: Point, heading: str | None, target: Point
+    ) -> bool | None:
+        """Whether a ghost's next step can bring it closer to ``target``.
+
+        Ghosts never reverse on their own, so only the moves other than
+        straight back count (all moves at a dead end, or for a ghost with no
+        heading yet). A ghost on the target counts as approaching. None when
+        the ghost is off Pac-Man's graph (in the house or on the gate) or
+        cannot reach the target.
+        """
+        static = self.static
+        ghost_id = static.point_ids.get(ghost)
+        if ghost_id is None:
+            return None
+        target_id = static.point_ids[target]
+        row_distance = static.distances[ghost_id][target_id]
+        if row_distance >= self.unreachable_distance:
+            return None
+        if row_distance == 0:
+            return True
+        adjacent = static.neighbors[ghost]
+        back = REVERSE_DIRECTION.get(heading) if heading else None
+        options = [point for action, point in adjacent.items() if action != back]
+        if not options:
+            options = list(adjacent.values())
+        if not options:
+            return None
+        return min(
+            static.distances[static.point_ids[point]][target_id] for point in options
+        ) < row_distance
+
+    def _danger_ghost_approaching(
+        self, candidate: Point, danger: list[tuple[Point, str | None]]
+    ) -> float:
+        """+1 if the dangerous ghost nearest the candidate tile is heading
+        towards it, -1 if heading away, 0 with no reachable dangerous ghost."""
+        nearest = None
+        nearest_distance = self.unreachable_distance
+        for position, heading in danger:
+            distance = self.static.distance(candidate, position)
+            if distance < nearest_distance:
+                nearest, nearest_distance = (position, heading), distance
+        if nearest is None:
+            return 0.0
+        approaching = self._approaching(nearest[0], nearest[1], candidate)
+        if approaching is None:
+            return 0.0
+        return 1.0 if approaching else -1.0
+
+    def _pincer(
+        self, origin: Point, candidate: Point, danger: list[tuple[Point, str | None]]
+    ) -> float:
+        """1 when the move heads towards a dangerous ghost while another closes
+        in from behind, both within GHOST_NEAR_RADIUS of the candidate tile.
+
+        A ghost is ahead when the move brings Pac-Man closer to it, behind when
+        the move takes him further away and the ghost is heading towards him.
+        """
+        ahead = behind = False
+        for position, heading in danger:
+            to_candidate = self.static.distance(candidate, position)
+            if to_candidate > GHOST_NEAR_RADIUS:
+                continue
+            to_origin = self.static.distance(origin, position)
+            if to_candidate < to_origin:
+                ahead = True
+            elif to_candidate > to_origin and self._approaching(position, heading, origin):
+                behind = True
+        return float(ahead and behind)
+
+    def _safe_territory(self, candidate: Point, ghost_distances: Mapping[Point, int]) -> float:
+        """Share of the maze's tiles Pac-Man reaches strictly before every
+        dangerous ghost, moving onto the candidate tile first.
+
+        Pac-Man reaches a tile at 1 + its path length from the candidate,
+        counting only paths through tiles he also reaches first; a ghost
+        reaches it at its own path length. Ties go to the ghost, and speeds
+        and the ghosts' no-reverse rule are ignored, so this errs towards
+        caution.
+
+        The "only through tiles he reaches first" condition never removes a
+        tile: if 1 + d(candidate, x) < g(x), every tile y on a shortest path
+        to x also has 1 + d(candidate, y) < g(y), because g(y) >= g(x) -
+        d(y, x). So this counts tiles with 1 + d(candidate, x) < g(x) from the
+        all-pairs distances instead of searching (same result, much faster).
+        """
+        row = self.static.distances[self.static.point_ids[candidate]]
+        points = self.static.points
+        safe = sum(
+            1 + distance < ghost_distances[point]
+            for distance, point in zip(row, points)
+        )
+        return safe / len(points)
+
+    def _safe_pellet_distance(
+        self, candidate: Point, ghost_distances: Mapping[Point, int]
+    ) -> float:
+        """Path distance from the candidate tile to the nearest pellet or power
+        pellet that Pac-Man reaches strictly before every dangerous ghost
+        (1 + d(candidate, x) < nearest ghost's d(x), as in safe_territory, so
+        the whole path there is safe too). 1.0 when no pellet is safe."""
+        best = self.unreachable_distance
+        for point in self._collectibles:
+            distance = self.static.distance(candidate, point)
+            if distance < best and 1 + distance < ghost_distances[point]:
+                best = distance
+        return self._normalized_distance(best)
+
+    def _safe_power_pellet_distance(
+        self, candidate: Point, ghost_distances: Mapping[Point, int]
+    ) -> float:
+        """Like safe_pellet_distance, but only power pellets."""
+        best = self.unreachable_distance
+        for point in self._power_pellets:
+            distance = self.static.distance(candidate, point)
+            if distance < best and 1 + distance < ghost_distances[point]:
+                best = distance
+        return self._normalized_distance(best)
+
+    @staticmethod
+    def _route_meets(
+        tiles: tuple[Point, ...], first_time: int,
+        ghost_paths: Mapping[str, tuple[Point, ...]],
+    ) -> bool:
+        """True if Pac-Man, on tiles[i] at time first_time + i, comes within
+        one step of a predicted ghost on the same tile."""
+        for path in ghost_paths.values():
+            for t, tile in enumerate(path):
+                for i, point in enumerate(tiles):
+                    if point == tile and abs(t - (first_time + i)) <= 1:
+                        return True
+        return False
+
+    def _onward_safe_exits(
+        self, origin: Point, corridor: tuple[Point, ...],
+        ghost_paths: Mapping[str, tuple[Point, ...]],
+    ) -> float:
+        """Share of the corridors leaving this move's far junction (not the
+        way back) that no predicted ghost route meets while Pac-Man walks this
+        corridor and then that one, routes predicted GHOST_FAR_PREDICTION_STEPS
+        ahead. 0 when this corridor itself meets a route or leads nowhere."""
+        if self._route_meets(corridor, 1, ghost_paths):
+            return 0.0
+        end = corridor[-1]
+        came_from = corridor[-2] if len(corridor) > 1 else origin
+        onward = [
+            self.static.corridors[(end, action)]
+            for action, point in self.neighbors[end].items() if point != came_from
+        ]
+        if not onward:
+            return 0.0
+        start = len(corridor) + 1
+        clear = sum(not self._route_meets(path, start, ghost_paths) for path in onward)
+        return clear / len(onward)
+
+    @staticmethod
+    def _ghost_path_conflict(
+        corridor: tuple[Point, ...], ghost_paths: Mapping[str, tuple[Point, ...]]
+    ) -> float:
+        """How soon a dangerous ghost's predicted route meets Pac-Man on the
+        corridor this move enters.
+
+        Pac-Man is on corridor[j] at time j + 1; a ghost is on path[t] at time
+        t (path[0] is where it is now). They meet when the tiles match within
+        one step of each other. Returns (K + 2 - T) / (K + 1) for the earliest
+        meeting time T (1 for a meeting next step, falling towards 0 later),
+        0 when no route meets the corridor within K = GHOST_PREDICTION_STEPS.
+        """
+        steps = GHOST_PREDICTION_STEPS
+        earliest = None
+        for path in ghost_paths.values():
+            for t, tile in enumerate(path[:steps + 1]):
+                for j, point in enumerate(corridor[:steps]):
+                    if point == tile and abs(t - (j + 1)) <= 1:
+                        meet = min(t, j + 1)
+                        if earliest is None or meet < earliest:
+                            earliest = meet
+        if earliest is None:
+            return 0.0
+        return (steps + 2 - max(1, earliest)) / (steps + 1)
+
     def for_legal_moves(
-        self, board: GameBoard, last_direction: str
+        self,
+        board: GameBoard,
+        last_direction: str,
+        ghost_directions: Mapping[str, str | None] | None = None,
+        ghost_paths: Mapping[str, tuple[Point, ...]] | None = None,
     ) -> dict[str, dict[str, float]]:
+        """Features of every legal move. ``ghost_directions`` (by GHOST_KEYS
+        key) gives the ghosts' current headings for the evasion features;
+        without it every ghost is treated as having no heading yet.
+        ``ghost_paths`` (by key) holds each dangerous ghost's predicted route
+        for ghost_path_conflict, from PacmanGame; without it that feature is 0."""
         danger_ghosts, edible_ghosts = self._sync_ghosts(board)
+        scared = board.ghost_scared
+        headings = ghost_directions or {}
+        danger_headed = [
+            (getattr(board, key), headings.get(key)) for key in GHOST_KEYS
+            if not scared[key.removesuffix("_pos")]
+        ]
+        ghost_distances = self.distance_map("danger_ghost", board)
         pellet_distances = self.distance_map("pellet", board)
         power_distances = self.distance_map("power_pellet", board)
         frightened_time = min(1.0, board.player_powerup_turns / self.powerup_duration)
+        # Same for every move: pellets (and power pellets) still on the board
+        # as a share of the whole board, counting an endgame's head start.
+        pellet_total = board.pellets_eaten + board.pellets_remaining
+        pellets_left = board.pellets_remaining / pellet_total if pellet_total else 0.0
+        elroy = sum(board.pellets_remaining <= dots for dots in ELROY_STAGE_DOTS) / 2
+        blinky = None if scared["blinky"] else board.blinky_pos
         unreachable = self.unreachable_distance
         adjacent = self.neighbors.get(board.player_pos, {})
         result = {}
@@ -494,5 +761,28 @@ class ObservationProvider:
                 ),
                 "junction_ghost_margin": junction_margin,
                 "safe_escape_options": safe_exits,
+                "danger_ghost_approaching": self._danger_ghost_approaching(
+                    candidate, danger_headed
+                ),
+                "pincer": self._pincer(board.player_pos, candidate, danger_headed),
+                "safe_territory": self._safe_territory(candidate, ghost_distances),
+                "pellets_left": pellets_left,
+                "safe_pellet_distance": self._safe_pellet_distance(
+                    candidate, ghost_distances
+                ),
+                "ghost_path_conflict": self._ghost_path_conflict(
+                    corridor, ghost_paths or {}
+                ),
+                "blinky_distance": self._normalized_distance(
+                    unreachable if blinky is None
+                    else self.static.distance(candidate, blinky)
+                ),
+                "elroy": elroy,
+                "safe_power_pellet_distance": self._safe_power_pellet_distance(
+                    candidate, ghost_distances
+                ),
+                "onward_safe_exits": self._onward_safe_exits(
+                    board.player_pos, corridor, ghost_paths or {}
+                ),
             }
         return result

@@ -324,10 +324,15 @@ def load_sprite(name: str, tile_size: tuple[int, int]) -> Image.Image:
     return sprite
 
 
-def render_board(board: GameBoard) -> Image.Image:
+def render_board(
+    board: GameBoard, wall_color: tuple[int, int, int] | None = None
+) -> Image.Image:
+    """Compose a board image, always placing floor below every other layer.
+
+    ``wall_color`` repaints the walls (blue in the sprite) in that RGB colour.
+    """
     from PIL import Image, ImageDraw
 
-    """Compose a board image, always placing floor below every other layer."""
     floor = Image.open(GRAPHICS_DIR / "floor.png").convert("RGBA")
     tile_width, tile_height = floor.size
     tile_size = floor.size
@@ -337,6 +342,12 @@ def render_board(board: GameBoard) -> Image.Image:
         PELLET: load_sprite("orb.png", tile_size),
         POWER_PELLET: load_sprite("power_orb.png", tile_size),
     }
+
+    if wall_color is not None:
+        # Same shape as the wall sprite, in the requested colour.
+        painted = Image.new("RGBA", tile_size, (*wall_color, 255))
+        painted.putalpha(sprites[WALL].getchannel("A"))
+        sprites[WALL] = painted
 
     entity_sprites = {
         "player_pos": load_sprite("pacman.png", tile_size),

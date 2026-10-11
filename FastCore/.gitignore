@@ -1,0 +1,3 @@
+# Built engine modules (rebuild with FastCore/build.sh)
+*.so
+__pycache__/

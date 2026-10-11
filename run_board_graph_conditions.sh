@@ -2,7 +2,8 @@
 # Shared engine for comparison experiments: runs every listed condition for
 # every seed, one after another, and prints a comparison table at the end.
 # Use the wrappers run_board_graph_repair_comparison.sh,
-# run_board_graph_ablation.sh and run_board_graph_endgame_experiment.sh, or
+# run_board_graph_ablation.sh, run_board_graph_endgame_experiment.sh and
+# run_board_graph_evasion_experiment.sh, or
 # set BOARD_GRAPH_CONDITIONS yourself.
 #
 # Each condition is the baseline below with ONE setting changed, so a
@@ -49,6 +50,12 @@ condition_flags() {
     # Endgame experiment (run_board_graph_endgame_experiment.sh).
     scaled_stagnation) echo "--stagnation-scaling inverse" ;;
     late_pellets)      echo "--late-pellet-share 0.5" ;;
+    # Evasion experiment (run_board_graph_evasion_experiment.sh): the baseline
+    # terminals plus one or all of the evasion features.
+    approaching)       echo "--add-features danger_ghost_approaching" ;;
+    pincer)            echo "--add-features pincer" ;;
+    safe_territory)    echo "--add-features safe_territory" ;;
+    evasion)           echo "--add-features all" ;;
     endgame)
       echo "--boards-per-generation $(( ${BOARD_GRAPH_FULL_BOARDS:-5} + ${BOARD_GRAPH_ENDGAME_BOARDS:-3} ))" \
         "--endgame-boards ${BOARD_GRAPH_ENDGAME_BOARDS:-3}" \
@@ -97,7 +104,8 @@ if [[ "${BOARD_GRAPH_DETACHED:-}" != 1 ]]; then
   exit 0
 fi
 
-source GeneticAlgo/.venv/bin/activate
+# BOARD_GRAPH_VENV=GeneticAlgo/.venv-pypy trains under PyPy (see check_pypy.sh).
+source "${BOARD_GRAPH_VENV:-GeneticAlgo/.venv}/bin/activate"
 
 # Detached loop. This shell ignores Ctrl-C (it was started in the background),
 # so the launcher signals USR1 instead. The trainer runs as a background child

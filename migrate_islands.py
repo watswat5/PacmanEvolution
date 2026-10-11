@@ -46,6 +46,13 @@ def load(path: Path) -> dict:
         return pickle.load(handle)
 
 
+def without_scores(tree):
+    """A migrant plays its new island's boards itself: drop the per-board
+    results it brings from home (train_board_graph's board cache)."""
+    tree.board_scores = {}
+    return tree
+
+
 def fitness_of(tree) -> float | None:
     return tree.fitness.values[0] if tree.fitness.valid else None
 
@@ -86,7 +93,7 @@ def main() -> int:
     rng = random.Random(f"{args.seed}-{args.generation}")
     # Choose every migrant before anything is replaced.
     outgoing = {
-        (source, target): [copy.deepcopy(tree) for tree in rng.sample(data["population"], args.migrants)]
+        (source, target): [without_scores(copy.deepcopy(tree)) for tree in rng.sample(data["population"], args.migrants)]
         for source, data in islands.items()
         for target in islands if target != source
     }

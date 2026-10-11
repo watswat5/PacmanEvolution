@@ -16,18 +16,18 @@ import random
 import sys
 from collections import deque
 from functools import lru_cache
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields
 from pathlib import Path
 from typing import Any, Callable, Mapping
 
 try:
-    from .board_graph import ObservationProvider, StaticBoardGraph, _layout_key
+    from .board_graph import GHOST_FAR_PREDICTION_STEPS, GHOST_PREDICTION_STEPS, ObservationProvider, StaticBoardGraph, _layout_key
     from .render_board import (
         GHOST_GATE, PELLET, PLAYER_LOCATION, POWER_PELLET, WALL,
         GameBoard, read_board, render_board, write_board,
     )
 except ImportError:  # Direct execution: python PacmanGame/pacman.py
-    from board_graph import ObservationProvider, StaticBoardGraph, _layout_key
+    from board_graph import GHOST_FAR_PREDICTION_STEPS, GHOST_PREDICTION_STEPS, ObservationProvider, StaticBoardGraph, _layout_key
     from render_board import (
         GHOST_GATE, PELLET, PLAYER_LOCATION, POWER_PELLET, WALL,
         GameBoard, read_board, render_board, write_board,
@@ -35,6 +35,25 @@ except ImportError:  # Direct execution: python PacmanGame/pacman.py
 
 
 Point = tuple[int, int]
+_BOARD_FIELDS = frozenset(field.name for field in fields(GameBoard))
+
+
+def replace(board: GameBoard, **changes: object) -> GameBoard:
+    """``dataclasses.replace`` for boards, without rerunning ``__init__``.
+
+    The game builds a new board several times per step. Copying the field
+    dictionary is several times faster and gives the same new, frozen board.
+    """
+    unknown = changes.keys() - _BOARD_FIELDS
+    if unknown:
+        raise TypeError(f"unknown board field(s): {', '.join(sorted(unknown))}")
+    new = object.__new__(type(board))
+    state = new.__dict__  # the dataclass is frozen, so write the dict directly
+    state.update(board.__dict__)
+    state.update(changes)
+    return new
+
+
 ACTIONS = ("up", "down", "left", "right")
 DIRECTIONS: dict[str, Point] = {
     "up": (0, -1),
@@ -196,8 +215,59 @@ class PacmanGame:
         otherwise mutates the game state.
         """
         return self._observation_provider.for_legal_moves(
-            self.board, self.player_direction
+            self.board, self.player_direction, self._ghost_directions,
+            self.predicted_ghost_paths(GHOST_FAR_PREDICTION_STEPS),
         )
+
+    def predicted_ghost_paths(
+        self, steps: int = GHOST_PREDICTION_STEPS
+    ) -> dict[str, tuple[Point, ...]]:
+        """Each dangerous ghost's route for the next ``steps`` tiles, as a
+        player who knows the targeting rules would predict it.
+
+        Only active ghosts that are not frightened are predicted. Each takes
+        the turn its normal rule picks, with Pac-Man (and Blinky, for Inky)
+        held where they are now and the current scatter/chase mode; reversal
+        signals, speeds and the tunnel are ignored. The route starts with the
+        ghost's current tile. Read-only.
+        """
+        paths = {}
+        for key in GHOST_KEYS:
+            if self._ghost_state[key] != "active" or self._ghost_frightened[key]:
+                continue
+            position = getattr(self.board, key)
+            previous = self._ghost_directions[key]
+            path = [position]
+            for _ in range(steps):
+                options = {}
+                for direction in GHOST_DIRECTION_ORDER:
+                    destination = self._destination(position, direction)
+                    if not self._can_enter(destination, ghost=True):
+                        continue
+                    if (
+                        self._tile(destination) & GHOST_GATE
+                        or destination in self._ghost_house
+                    ):
+                        continue
+                    if direction == "up" and position in self._no_up_tiles:
+                        continue
+                    options[direction] = destination
+                if not options:
+                    break
+                if previous is not None and len(options) > 1:
+                    options.pop(REVERSE_DIRECTION[previous], None)
+                target = self._ghost_target(key, position)
+                previous = min(
+                    options,
+                    key=lambda d: (
+                        self._distance_squared(options[d], target),
+                        GHOST_DIRECTION_ORDER.index(d),
+                    ),
+                )
+                position = options[previous]
+                path.append(position)
+            paths[key] = tuple(path)
+        return paths
 
     def get_distance_map(self, target: str) -> Mapping[Point, int]:
         """Return cached tile distances for a named dynamic target category."""
@@ -354,6 +424,10 @@ class PacmanGame:
         self._exit_tiles = frozenset(
             (x, y - 1) for x, y in self._gate_positions if y > 0
         )
+        # Only a board that starts with the bit-16 location marker ever has it.
+        self._uses_location_marker = any(
+            value & PLAYER_LOCATION for row in self.board.tiles for value in row
+        )
         self._release_ghosts()
 
     @property
@@ -444,7 +518,7 @@ class PacmanGame:
             self._step_frames += DOT_PAUSE_FRAMES
 
         # If a board uses bit 16 as a location marker, keep that marker current.
-        if any(value & PLAYER_LOCATION for row in self.board.tiles for value in row):
+        if self._uses_location_marker:
             for row in self.board.tiles:
                 for index, value in enumerate(row):
                     row[index] = value & ~PLAYER_LOCATION
@@ -701,7 +775,9 @@ class PacmanGame:
         self.turn += 1
         self.board = replace(self.board, game_turn=self.turn)
         self._sync_board_observations()
-        self.won = self._board_is_complete()
+        # Same answer as scanning the tiles (they only lose pellets in
+        # _move_player, which tells the provider), without the scan.
+        self.won = self._observation_provider.collectibles_left == 0
         return StepResult(
             observation=self.observation(),
             reward=self.board.score - previous_score,

@@ -51,6 +51,11 @@ CONDITION_COLORS = {
     "global": "#e87ba4",
     "grid8x8": "#008300",
     "no_junction": "#4a3aa7",
+    # Endgame experiment (a separate directory, so the colours can repeat).
+    "scaled_stagnation": "#2a78d6",
+    "late_pellets": "#eb6834",
+    "endgame": "#1baf7a",
+    "baseline_depth16": "#eda100",
 }
 EXTRA_COLOR = "#e34948"  # any condition not listed above
 # Islands take the categorical palette in seed order.
@@ -142,11 +147,13 @@ def spread_labels(positions: list[float], gap: float) -> list[float]:
 
 def plot_metric(runs, metric, seeds: list[str], smooth: int, output: Path,
                 subtitle: str | None = None, mean_line: bool = False,
-                markers: tuple[int, ...] = ()) -> None:
+                markers: tuple[int, ...] = (), generation_of=lambda index: index) -> None:
     """One line per condition: that seed's run, or the mean over ``seeds``.
 
     ``mean_line`` adds the mean of all the lines (used for islands), and
     ``markers`` draws a faint vertical line at each of those generations.
+    ``generation_of`` maps a row's position to its generation, for series that
+    do not have one row per generation.
     """
     name, title, ylabel, value, smoothed, note = metric
     figure, axis = plt.subplots(figsize=(12, 6.6), facecolor=SURFACE)
@@ -166,7 +173,7 @@ def plot_metric(runs, metric, seeds: list[str], smooth: int, output: Path,
             continue
         # Average generation by generation over the seeds that reached it.
         length = max(len(values) for values in series)
-        generations = list(range(length))
+        generations = [generation_of(index) for index in range(length)]
         values = [
             sum(run[index] for run in series if index < len(run))
             / sum(index < len(run) for run in series)
@@ -226,7 +233,9 @@ def plot_metric(runs, metric, seeds: list[str], smooth: int, output: Path,
         text.set_color(INK)
     if note:
         figure.text(0.065, 0.012, note, fontsize=9, color=MUTED, ha="left", va="bottom")
-    figure.subplots_adjust(left=0.065, right=0.885, top=0.87, bottom=0.17)
+    # Leave room on the right for the longest end-of-line label.
+    longest = max((len(name) for name in lines), default=0)
+    figure.subplots_adjust(left=0.065, right=min(0.885, 0.97 - 0.0075 * longest), top=0.87, bottom=0.17)
     figure.savefig(output / f"{name}.png", dpi=130, facecolor=SURFACE)
     plt.close(figure)
 
